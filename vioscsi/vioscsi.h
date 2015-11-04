@@ -1,5 +1,5 @@
 /**********************************************************************
- * Copyright (c) 2012  Red Hat, Inc.
+ * Copyright (c) 2012-2015  Red Hat, Inc.
  *
  * File: vioscsi.h
  *
@@ -16,10 +16,13 @@
 
 #include <ntddk.h>
 #include <storport.h>
+#include "scsiwmi.h"
 
 #include "osdep.h"
 #include "virtio_pci.h"
-#include "VirtIO.h"
+#include "virtio_config.h"
+#include "virtio.h"
+#include "virtio_ring.h"
 
 typedef struct VirtIOBufferDescriptor VIO_SG, *PVIO_SG;
 
@@ -32,6 +35,7 @@ typedef struct VirtIOBufferDescriptor VIO_SG, *PVIO_SG;
 #define MAX_PHYS_SEGMENTS       16
 #endif
 
+#define VIOSCSI_POOL_TAG        'SoiV'
 #define VIRTIO_MAX_SG            (3+MAX_PHYS_SEGMENTS)
 
 #define SECTOR_SIZE             512
@@ -224,7 +228,7 @@ typedef struct _SRB_EXTENSION {
 #if (INDIRECT_SUPPORTED == 1)
     struct vring_desc_alias     desc[VIRTIO_MAX_SG];
 #endif
-    PROCESSOR_NUMBER      procNum;
+//    UCHAR                 PathId;
 }SRB_EXTENSION, * PSRB_EXTENSION;
 #pragma pack()
 
@@ -264,11 +268,11 @@ typedef struct _ADAPTER_EXTENSION {
     ULONG                 num_queues;
     UCHAR                 cpu_to_vq_map[MAX_CPU];
     ULONG                 perfFlags;
-
+    PGROUP_AFFINITY       pmsg_affinity;
     BOOLEAN               dpc_ok;
     PSTOR_DPC             dpc;
-    LIST_ENTRY            srb_list[MAX_CPU];
 
+    SCSI_WMILIB_CONTEXT   WmiLibContext;
 }ADAPTER_EXTENSION, * PADAPTER_EXTENSION;
 
 #if (MSI_SUPPORTED == 1)

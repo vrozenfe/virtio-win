@@ -1,5 +1,5 @@
 /**********************************************************************
- * Copyright (c) 2012  Red Hat, Inc.
+ * Copyright (c) 2012-2015 Red Hat, Inc.
  *
  * File: helper.h
  *
@@ -24,7 +24,7 @@
 #include "virtio_pci.h"
 #include "vioscsi.h"
 
-VOID
+BOOLEAN
 SendSRB(
     IN PVOID DeviceExtension,
     IN PSCSI_REQUEST_BLOCK Srb
@@ -85,11 +85,24 @@ VioScsiCompleteDpcRoutine(
 );
 
 VOID
-FORCEINLINE
 ProcessQueue(
     IN PVOID DeviceExtension,
     IN ULONG MessageID,
     IN BOOLEAN dpc
+    );
+
+ULONG
+VioScsiAcquireSpinLock(
+    IN PVOID DeviceExtension,
+    IN ULONG MessageID,
+    IN PSTOR_LOCK_HANDLE LockHandle
+    );
+
+ULONG
+VioScsiReleaseSpinLock(
+    IN PVOID DeviceExtension,
+    IN ULONG MessageID,
+    IN PSTOR_LOCK_HANDLE LockHandle
     );
 
 #endif ___HELPER_H___

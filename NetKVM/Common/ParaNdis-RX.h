@@ -1,5 +1,5 @@
+#pragma once
 #include "ParaNdis-VirtQueue.h"
-#include "ndis56common.h"
 #include "ParaNdis-AbstractPath.h"
 
 class CParaNdisRX : public CParaNdisTemplatePath<CVirtQueue>, public CNdisAllocatable < CParaNdisRX, 'XRHR' > {
@@ -13,53 +13,28 @@ public:
 
     void PopulateQueue();
 
-    void Renew() {
-        m_VirtQueue.Renew();
-    }
-
-    void Shutdown() {
-        CLockedContext<CNdisSpinLock> autoLock(m_Lock);
-        m_VirtQueue.Shutdown();
-    }
-
     void FreeRxDescriptorsFromList();
 
-    void ReuseReceiveBuffer(LONG regular, pRxNetDescriptor pBuffersDescriptor)
+    void ReuseReceiveBuffer(pRxNetDescriptor pBuffersDescriptor)
     {
         CLockedContext<CNdisSpinLock> autoLock(m_Lock);
 
-        ReuseReceiveBufferNoLock(regular, pBuffersDescriptor);
-    }
-
-    void ReuseReceiveBufferNoLock(LONG regular, pRxNetDescriptor pBuffersDescriptor)
-    {
-        if (regular)
-        {
-            ReuseReceiveBufferRegular(pBuffersDescriptor);
-        }
-        else
-        {
-            ReuseReceiveBufferPowerOff(pBuffersDescriptor);
-        }
+        ReuseReceiveBufferNoLock(pBuffersDescriptor);
     }
 
     VOID ProcessRxRing(CCHAR nCurrCpuReceiveQueue);
 
-    void EnableInterrupts() {
-        m_VirtQueue.EnableInterrupts();
-    }
-
-    //TODO: Needs review/temporary?
-    void DisableInterrupts() {
-        m_VirtQueue.DisableInterrupts();
-    }
-
     BOOLEAN RestartQueue();
 
-    BOOLEAN IsInterruptEnabled() {
-        return m_VirtQueue.IsInterruptEnabled();
+    void Shutdown()
+    {
+        CLockedContext<CNdisSpinLock> autoLock(m_Lock);
+
+        m_VirtQueue.Shutdown();
+        m_Reinsert = false;
     }
 
+    PARANDIS_RECEIVE_QUEUE &UnclassifiedPacketsQueue() { return m_UnclassifiedPacketsQueue;  }
 
 private:
     /* list of Rx buffers available for data (under VIRTIO management) */
@@ -68,9 +43,11 @@ private:
 
     UINT m_nReusedRxBuffersCounter, m_nReusedRxBuffersLimit;
 
-    void ReuseReceiveBufferRegular(pRxNetDescriptor pBuffersDescriptor);
-    void ReuseReceiveBufferPowerOff(pRxNetDescriptor pBuffersDescriptor);
+    bool m_Reinsert = true;
 
+    PARANDIS_RECEIVE_QUEUE m_UnclassifiedPacketsQueue;
+
+    void ReuseReceiveBufferNoLock(pRxNetDescriptor pBuffersDescriptor);
 private:
     int PrepareReceiveBuffers();
     pRxNetDescriptor CreateRxDescriptorOnInit();

@@ -16,7 +16,7 @@
  *
  */
 /**********************************************************************
- * Copyright (c) 2008  Red Hat, Inc.
+ * Copyright (c) 2008-2015 Red Hat, Inc.
  *
  * This work is licensed under the terms of the GNU GPL, version 2.  See
  * the COPYING file in the top-level directory.
@@ -24,7 +24,6 @@
 **********************************************************************/
 #include "osdep.h"
 #include "VirtIO_PCI.h"
-#include "VirtIO.h"
 #include "virtio_stor_utils.h"
 #include "virtio_stor.h"
 

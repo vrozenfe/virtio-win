@@ -1,6 +1,14 @@
 #include "ndis56common.h"
+#include "kdebugprint.h"
 
 #if PARANDIS_SUPPORT_RSS
+
+#define RSS_PRINT_LEVEL 0
+
+static void PrintIndirectionTable(const NDIS_RECEIVE_SCALE_PARAMETERS* Params);
+static void PrintIndirectionTable(const PARANDIS_SCALING_SETTINGS *RSSScalingSetting);
+
+static void PrintRSSSettings(PPARANDIS_RSS_PARAMS RSSParameters);
 
 static VOID ApplySettings(PPARANDIS_RSS_PARAMS RSSParameters,
         PARANDIS_RSS_MODE NewRSSMode,
@@ -122,7 +130,7 @@ CCHAR FindReceiveQueueForCurrentCpu(PPARANDIS_SCALING_SETTINGS RSSScalingSetting
     ASSERT(CurrProcIdx != INVALID_PROCESSOR_INDEX);
 
     if(CurrProcIdx >= RSSScalingSettings->CPUIndexMappingSize)
-        return PARANDIS_RECEIVE_QUEUE_UNCLASSIFIED;
+        return PARANDIS_RECEIVE_NO_QUEUE;
 
     return RSSScalingSettings->CPUIndexMapping[CurrProcIdx];
 }
@@ -146,7 +154,7 @@ BOOLEAN AllocateCPUMappingArray(NDIS_HANDLE NdisHandle, PPARANDIS_SCALING_SETTIN
 
     for(i = 0; i < CPUNumber; i++)
     {
-        RSSScalingSettings->CPUIndexMapping[i] = PARANDIS_RECEIVE_QUEUE_UNCLASSIFIED;
+        RSSScalingSettings->CPUIndexMapping[i] = PARANDIS_RECEIVE_NO_QUEUE;
     }
 
     return TRUE;
@@ -159,6 +167,9 @@ VOID FillCPUMappingArray(
 {
     ULONG i;
     CCHAR ReceiveQueue = PARANDIS_FIRST_RSS_RECEIVE_QUEUE;
+    auto IndirectionTableChanged = false;
+
+    RSSScalingSettings->FirstQueueIndirectionIndex = INVALID_INDIRECTION_INDEX;
 
     for (i = 0; i < RSSScalingSettings->IndirectionTableSize/sizeof(PROCESSOR_NUMBER); i++)
     {
@@ -167,18 +178,48 @@ VOID FillCPUMappingArray(
 
         if(CurrProcIdx != INVALID_PROCESSOR_INDEX)
         {
-            if(RSSScalingSettings->CPUIndexMapping[CurrProcIdx] == PARANDIS_RECEIVE_QUEUE_UNCLASSIFIED)
-                RSSScalingSettings->CPUIndexMapping[CurrProcIdx] = ReceiveQueue++;
+            if (RSSScalingSettings->CPUIndexMapping[CurrProcIdx] == PARANDIS_RECEIVE_NO_QUEUE)
+            {
+                if (ReceiveQueue == PARANDIS_FIRST_RSS_RECEIVE_QUEUE)
+                    RSSScalingSettings->FirstQueueIndirectionIndex = i;
+
+                if (ReceiveQueue != ReceiveQueuesNumber)
+                {
+                    RSSScalingSettings->CPUIndexMapping[CurrProcIdx] = ReceiveQueue++;
+                }
+            }
 
             RSSScalingSettings->QueueIndirectionTable[i] = RSSScalingSettings->CPUIndexMapping[CurrProcIdx];
 
-            if(ReceiveQueue == ReceiveQueuesNumber)
-                ReceiveQueue = PARANDIS_FIRST_RSS_RECEIVE_QUEUE;
         }
         else
         {
-            RSSScalingSettings->QueueIndirectionTable[i] = PARANDIS_RECEIVE_QUEUE_UNCLASSIFIED;
+            RSSScalingSettings->QueueIndirectionTable[i] = PARANDIS_RECEIVE_NO_QUEUE;
         }
+    }
+
+    if (RSSScalingSettings->FirstQueueIndirectionIndex == INVALID_INDIRECTION_INDEX)
+    {
+        DPrintf(0, ("[%s] - CPU <-> queue assignment failed!", __FUNCTION__));
+        return;
+    }
+
+    for (i = 0; i < RSSScalingSettings->IndirectionTableSize / sizeof(PROCESSOR_NUMBER); i++)
+    {
+        if (RSSScalingSettings->QueueIndirectionTable[i] == PARANDIS_RECEIVE_NO_QUEUE)
+        {
+            /* If some hash values remains unassigned after the first pass, either because
+            mapping processor number to index failed or there are not enough queues,
+            reassign the hash values to the first queue*/
+            RSSScalingSettings->QueueIndirectionTable[i] = PARANDIS_FIRST_RSS_RECEIVE_QUEUE;
+            RSSScalingSettings->IndirectionTable[i] = RSSScalingSettings->IndirectionTable[RSSScalingSettings->FirstQueueIndirectionIndex];
+            IndirectionTableChanged = true;
+        }
+    }
+
+    if (IndirectionTableChanged)
+    {
+        DPrintf(0, ("[%s] Indirection table changed\n", __FUNCTION__));
     }
 }
 
@@ -231,8 +272,13 @@ NDIS_STATUS ParaNdis6_RSSSetParameters( PARANDIS_RSS_PARAMS *RSSParameters,
     }
     else
     {
+        DPrintf(0, ("[%s] RSS Params: flags 0x%4.4x, hash information 0x%4.4lx\n",
+            __FUNCTION__, Params->Flags, Params->HashInformation));
+
         if (!(Params->Flags & NDIS_RSS_PARAM_FLAG_ITABLE_UNCHANGED))
         {
+            PrintIndirectionTable(Params);
+
             if(!AllocateCPUMappingArray(NdisHandle, &RSSParameters->RSSScalingSettings))
                 return NDIS_STATUS_RESOURCES;
 
@@ -245,6 +291,7 @@ NDIS_STATUS ParaNdis6_RSSSetParameters( PARANDIS_RSS_PARAMS *RSSParameters,
             *ParamsBytesRead += ProcessorMasksSize;
 
             FillCPUMappingArray(&RSSParameters->RSSScalingSettings, RSSParameters->ReceiveQueuesNumber);
+            PrintRSSSettings(RSSParameters);
         }
 
         if (!(Params->Flags & NDIS_RSS_PARAM_FLAG_HASH_INFO_UNCHANGED))
@@ -535,15 +582,28 @@ CCHAR ParaNdis6_RSSGetScalingDataForPacket(
     CCHAR targetQueue;
     CNdisDispatchReadAutoLock autoLock(RSSParameters->rwLock);
 
-    if((RSSParameters->RSSMode != PARANDIS_RSS_FULL) || (packetInfo->RSSHash.Type == 0))
+    if (RSSParameters->RSSMode != PARANDIS_RSS_FULL || 
+        RSSParameters->ActiveRSSScalingSettings.FirstQueueIndirectionIndex == INVALID_INDIRECTION_INDEX)
     {
-        targetQueue = PARANDIS_RECEIVE_QUEUE_UNCLASSIFIED;
+        targetQueue = PARANDIS_RECEIVE_UNCLASSIFIED_PACKET;
+    }
+    else if (packetInfo->RSSHash.Type == 0)
+    {
+        targetQueue = PARANDIS_RECEIVE_UNCLASSIFIED_PACKET;
     }
     else
     {
         ULONG indirectionIndex = packetInfo->RSSHash.Value & RSSParameters->ActiveRSSScalingSettings.RSSHashMask;
-        *targetProcessor = RSSParameters->ActiveRSSScalingSettings.IndirectionTable[indirectionIndex];
+
         targetQueue = RSSParameters->ActiveRSSScalingSettings.QueueIndirectionTable[indirectionIndex];
+        if (targetQueue == PARANDIS_RECEIVE_NO_QUEUE)
+        {
+            targetQueue = PARANDIS_RECEIVE_UNCLASSIFIED_PACKET;
+        }
+        else
+        {
+            *targetProcessor = RSSParameters->ActiveRSSScalingSettings.IndirectionTable[indirectionIndex];
+        }
     }
 
     return targetQueue;
@@ -556,7 +616,7 @@ CCHAR ParaNdis6_RSSGetCurrentCpuReceiveQueue(PARANDIS_RSS_PARAMS *RSSParameters)
 
     if(RSSParameters->RSSMode != PARANDIS_RSS_FULL)
     {
-        res = PARANDIS_RECEIVE_QUEUE_UNCLASSIFIED;
+        res = PARANDIS_RECEIVE_NO_QUEUE;
     }
     else
     {
@@ -564,6 +624,45 @@ CCHAR ParaNdis6_RSSGetCurrentCpuReceiveQueue(PARANDIS_RSS_PARAMS *RSSParameters)
     }
 
     return res;
+}
+
+static void PrintIndirectionTable(const NDIS_RECEIVE_SCALE_PARAMETERS* Params)
+{
+    ULONG IndirectionTableEntries = Params->IndirectionTableSize / sizeof(PROCESSOR_NUMBER);
+    
+    DPrintf(RSS_PRINT_LEVEL, ("Params: flags 0x%4.4x, hash information 0x%4.4lx\n",
+        Params->Flags, Params->HashInformation));
+
+    DPrintf(RSS_PRINT_LEVEL, ("NDIS IndirectionTable[%lu]\n", IndirectionTableEntries));
+    ParaNdis_PrintTable<80, 20>(RSS_PRINT_LEVEL, (const PROCESSOR_NUMBER *)((char *)Params + Params->IndirectionTableOffset), IndirectionTableEntries,
+        "%u/%u", [](const PROCESSOR_NUMBER *proc) { return proc->Group; }, [](const PROCESSOR_NUMBER *proc) { return proc->Number; });
+}
+
+static void PrintIndirectionTable(const PARANDIS_SCALING_SETTINGS *RSSScalingSetting)
+{
+    ULONG IndirectionTableEntries = RSSScalingSetting->IndirectionTableSize/ sizeof(PROCESSOR_NUMBER);
+
+    DPrintf(RSS_PRINT_LEVEL, ("Driver IndirectionTable[%lu]\n", IndirectionTableEntries));
+    ParaNdis_PrintTable<80, 20>(RSS_PRINT_LEVEL, RSSScalingSetting->IndirectionTable, IndirectionTableEntries,
+        "%u/%u", [](const PROCESSOR_NUMBER *proc) { return proc->Group; }, [](const PROCESSOR_NUMBER *proc) { return proc->Number; });
+}
+
+
+static void PrintRSSSettings(const PPARANDIS_RSS_PARAMS RSSParameters)
+{
+    ULONG CPUNumber = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+
+    DPrintf(RSS_PRINT_LEVEL, ("%lu cpus, %d queues, first queue CPU index %ld",
+        CPUNumber, RSSParameters->ReceiveQueuesNumber,
+        RSSParameters->RSSScalingSettings.FirstQueueIndirectionIndex));
+
+    PrintIndirectionTable(&RSSParameters->ActiveRSSScalingSettings);
+
+    DPrintf(RSS_PRINT_LEVEL, ("CPU mapping table[%u]: ", RSSParameters->ActiveRSSScalingSettings.CPUIndexMappingSize));
+    ParaNdis_PrintCharArray(RSS_PRINT_LEVEL, RSSParameters->ActiveRSSScalingSettings.CPUIndexMapping, RSSParameters->ActiveRSSScalingSettings.CPUIndexMappingSize);
+
+    DPrintf(RSS_PRINT_LEVEL, ("Queue indirection table[%u]: ", RSSParameters->ReceiveQueuesNumber));
+    ParaNdis_PrintCharArray(RSS_PRINT_LEVEL, RSSParameters->ActiveRSSScalingSettings.QueueIndirectionTable, RSSParameters->ReceiveQueuesNumber);
 }
 
 #endif

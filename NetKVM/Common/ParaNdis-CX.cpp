@@ -1,4 +1,6 @@
 #include "ndis56common.h"
+#include "virtio_net.h"
+#include "kdebugprint.h"
 
 CParaNdisCX::CParaNdisCX()
 {
@@ -122,4 +124,11 @@ BOOLEAN CParaNdisCX::SendControlMessage(
         DPrintf(0, ("%s (buffer %d,%d) - ERROR: message too LARGE\n", __FUNCTION__, size1, size2));
     }
     return bOK;
+}
+
+NDIS_STATUS CParaNdisCX::SetupMessageIndex(u16 queueCardinal)
+{
+    WriteVirtIODeviceWord(m_Context->IODevice->addr + VIRTIO_MSI_CONFIG_VECTOR, (u16)queueCardinal);
+
+    return CParaNdisAbstractPath::SetupMessageIndex(queueCardinal);
 }

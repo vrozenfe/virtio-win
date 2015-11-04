@@ -1,5 +1,5 @@
 /**********************************************************************
- * Copyright (c) 2008  Red Hat, Inc.
+ * Copyright (c) 2008-2015 Red Hat, Inc.
  *
  * File: ParaNdis6-Impl.c
  *
@@ -10,6 +10,8 @@
  *
 **********************************************************************/
 #include "ParaNdis6.h"
+#include "kdebugprint.h"
+#include "ParaNdis_DebugHistory.h"
 
 static MINIPORT_DISABLE_INTERRUPT MiniportDisableInterruptEx;
 static MINIPORT_ENABLE_INTERRUPT MiniportEnableInterruptEx;
@@ -481,38 +483,39 @@ NDIS_STATUS ParaNdis_ConfigureMSIXVectors(PARANDIS_ADAPTER *pContext)
         {
             status = pContext->pPathBundles[j].rxPath.SetupMessageIndex(2 * u16(j) + 1);
             status = pContext->pPathBundles[j].txPath.SetupMessageIndex(2 * u16(j));
+            DPrintf(0, ("[%s] Using messages %u/%u for RX/TX queue %u\n", __FUNCTION__,
+                        pContext->pPathBundles[j].rxPath.getMessageIndex(),
+                        pContext->pPathBundles[j].txPath.getMessageIndex(),
+                        j));
         }
 
-        if (pContext->bCXPathCreated)
+        if (status == NDIS_STATUS_SUCCESS && pContext->bCXPathCreated)
         {
-            pContext->CXPath.SetupMessageIndex(2 * u16(pContext->nPathBundles));
+            /* We need own vector for control queue. If one is not available, fail the initialization */
+            if (pContext->nPathBundles * 2 > pTable->MessageCount - 1)
+            {
+                DPrintf(0, ("[%s] Not enough vectors for control queue!\n", __FUNCTION__));
+                status = NDIS_STATUS_RESOURCES;
+            }
+            else
+            {
+                status = pContext->CXPath.SetupMessageIndex(2 * u16(pContext->nPathBundles));
+                DPrintf(0, ("[%s] Using message %u for controls\n", __FUNCTION__, pContext->CXPath.getMessageIndex()));
+            }
         }
     }
 
-    if (status == NDIS_STATUS_SUCCESS)
-    {
-        for (UINT j = 0; j < pContext->nPathBundles && status == NDIS_STATUS_SUCCESS; ++j)
-        {
-            DPrintf(0, ("[%s] Using messages %u/%u for RX/TX queue %u\n", __FUNCTION__, pContext->pPathBundles[j].rxPath.getMessageIndex(),
-                pContext->pPathBundles[j].txPath.getMessageIndex(), j));
-        }
-        if (pContext->bCXPathCreated)
-        {
-            DPrintf(0, ("[%s] Using message %u for controls\n", __FUNCTION__, pContext->CXPath.getMessageIndex()));
-        }
-        else
-        {
-            DPrintf(0, ("[%s] - No control path\n", __FUNCTION__));
-        }
-    }
-    DEBUG_EXIT_STATUS(2, status);
+    DEBUG_EXIT_STATUS(0, status);
     return status;
 }
 
 void ParaNdis_RestoreDeviceConfigurationAfterReset(
     PARANDIS_ADAPTER *pContext)
 {
-    ParaNdis_ConfigureMSIXVectors(pContext);
+    if (pContext->bUsingMSIX)
+    {
+        ParaNdis_ConfigureMSIXVectors(pContext);
+    }
 }
 
 static void DebugParseOffloadBits()
@@ -600,7 +603,6 @@ NDIS_STATUS ParaNdis_FinishSpecificInitialization(PARANDIS_ADAPTER *pContext)
         status = NdisMRegisterInterruptEx(pContext->MiniportHandle, pContext, &mic, &pContext->InterruptHandle);
     }
 
-#ifdef DBG
     if (pContext->bUsingMSIX)
     {
         DPrintf(0, ("[%s] MSIX message table %savailable, count = %u\n", __FUNCTION__, (mic.MessageInfoTable == nullptr ? "not " : ""),
@@ -610,7 +612,6 @@ NDIS_STATUS ParaNdis_FinishSpecificInitialization(PARANDIS_ADAPTER *pContext)
     {
         DPrintf(0, ("[%s] Not using MSIX\n", __FUNCTION__));
     }
-#endif
 
     if (status == NDIS_STATUS_SUCCESS)
     {
@@ -844,7 +845,7 @@ tPacketIndicationType ParaNdis_PrepareReceivedPacket(
 
         if (pNBL)
         {
-            virtio_net_hdr_basic *pHeader = (virtio_net_hdr_basic *) pBuffersDesc->PhysicalPages[0].Virtual;
+            virtio_net_hdr *pHeader = (virtio_net_hdr *) pBuffersDesc->PhysicalPages[0].Virtual;
             tChecksumCheckResult csRes;
             pNBL->SourceHandle = pContext->MiniportHandle;
             NBLSetRSSInfo(pContext, pNBL, pPacketInfo);
@@ -866,7 +867,7 @@ tPacketIndicationType ParaNdis_PrepareReceivedPacket(
                     pHeader->flags,
                     &pBuffersDesc->PhysicalPages[PARANDIS_FIRST_RX_DATA_PAGE],
                     pPacketInfo->dataLength,
-                    nBytesStripped);
+                    nBytesStripped, TRUE);
                 if (csRes.value)
                 {
                     NDIS_TCP_IP_CHECKSUM_NET_BUFFER_LIST_INFO qCSInfo;
@@ -896,30 +897,6 @@ tPacketIndicationType ParaNdis_PrepareReceivedPacket(
         }
     }
     return pNBL;
-}
-
-VOID ParaNdis_IndicateReceivedBatch(
-    PARANDIS_ADAPTER *pContext,
-    tPacketIndicationType *pBatch,
-    ULONG nofPackets)
-{
-    ULONG i;
-    PNET_BUFFER_LIST pPrev = pBatch[0];
-    NET_BUFFER_LIST_NEXT_NBL(pPrev) = NULL;
-    for (i = 1; i < nofPackets; ++i)
-    {
-        PNET_BUFFER_LIST pNBL = pBatch[i];
-        NET_BUFFER_LIST_NEXT_NBL(pPrev) = pNBL;
-        NET_BUFFER_LIST_NEXT_NBL(pNBL)  = NULL;
-        pPrev = pNBL;
-    }
-    NdisMIndicateReceiveNetBufferLists(
-        pContext->MiniportHandle,
-        pBatch[0],
-        0,
-        nofPackets,
-        0);
-
 }
 
 
@@ -953,8 +930,9 @@ VOID ParaNdis6_ReturnNetBufferLists(
         pNBL = NET_BUFFER_LIST_NEXT_NBL(pNBL);
         NET_BUFFER_LIST_NEXT_NBL(pTemp) = NULL;
         NdisFreeNetBufferList(pTemp);
-        pBuffersDescriptor->Queue->ReuseReceiveBuffer(pContext->ReuseBufferRegular, pBuffersDescriptor);
+        pBuffersDescriptor->Queue->ReuseReceiveBuffer(pBuffersDescriptor);
     }
+    ParaNdis_TestPausing(pContext);
 }
 
 /**********************************************************
@@ -978,11 +956,12 @@ NDIS_STATUS ParaNdis6_ReceivePauseRestart(
 {
     NDIS_STATUS status = NDIS_STATUS_SUCCESS;
 
-    /* TODO - access to ReceiveState and ReceivePauseCompletionProc have to be synchronized*/
     if (bPause)
     {
+        CNdisPassiveWriteAutoLock tLock(pContext->m_PauseLock);
+
         ParaNdis_DebugHistory(pContext, hopInternalReceivePause, NULL, 1, 0, 0);
-        if (pContext->m_upstreamPacketPending != 0)
+        if (pContext->m_rxPacketsOutsideRing != 0)
         {
             pContext->ReceiveState = srsPausing;
             pContext->ReceivePauseCompletionProc = Callback;
@@ -1010,7 +989,6 @@ NDIS_STATUS ParaNdis_ExactSendFailureStatus(PARANDIS_ADAPTER *pContext)
     if (pContext->bSurprizeRemoved) status = NDIS_STATUS_NOT_ACCEPTED;
     // override NDIS_STATUS_PAUSED is there is a specific reason of implicit paused state
     if (pContext->powerState != NdisDeviceStateD0) status = NDIS_STATUS_LOW_POWER_STATE;
-    if (pContext->bResetInProgress) status = NDIS_STATUS_RESET_IN_PROGRESS;
     return status;
 }
 
@@ -1068,8 +1046,12 @@ NDIS_STATUS ParaNdis6_SendPauseRestart(
         ParaNdis_DebugHistory(pContext, hopInternalSendPause, NULL, 1, 0, 0);
         if (pContext->SendState == srsEnabled)
         {
-            pContext->SendState = srsPausing;
-            pContext->SendPauseCompletionProc = Callback;
+            {
+                CNdisPassiveWriteAutoLock tLock(pContext->m_PauseLock);
+
+                pContext->SendState = srsPausing;
+                pContext->SendPauseCompletionProc = Callback;
+            }
 
             for (UINT i = 0; i < pContext->nPathBundles; i++)
             {
@@ -1078,6 +1060,7 @@ NDIS_STATUS ParaNdis6_SendPauseRestart(
                     status = NDIS_STATUS_PENDING;
                 }
             }
+
             if (status == NDIS_STATUS_SUCCESS)
             {
                 pContext->SendState = srsDisabled;

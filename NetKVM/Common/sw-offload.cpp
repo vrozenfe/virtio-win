@@ -1,5 +1,5 @@
 /**********************************************************************
- * Copyright (c) 2008  Red Hat, Inc.
+ * Copyright (c) 2008-2015 Red Hat, Inc.
  *
  * File: sw-offload.c
  *
@@ -10,6 +10,7 @@
  *
 **********************************************************************/
 #include "ndis56common.h"
+#include "kdebugprint.h"
 
 // till IP header size is 8 bit
 #define MAX_SUPPORTED_IPV6_HEADERS  (256 - 4)
@@ -156,19 +157,21 @@ ProcessTCPHeader(tTcpIpPacketParsingResult _res, PVOID pIpHeader, ULONG len, USH
     ULONG tcpipDataAt;
     tTcpIpPacketParsingResult res = _res;
     tcpipDataAt = ipHeaderSize + sizeof(TCPHeader);
-    res.xxpStatus = ppresXxpIncomplete;
     res.TcpUdp = ppresIsTCP;
 
     if (len >= tcpipDataAt)
     {
         TCPHeader *pTcpHeader = (TCPHeader *)RtlOffsetToPointer(pIpHeader, ipHeaderSize);
         res.xxpStatus = ppresXxpKnown;
+        res.xxpFull = TRUE;
         tcpipDataAt = ipHeaderSize + TCP_HEADER_LENGTH(pTcpHeader);
         res.XxpIpHeaderSize = tcpipDataAt;
     }
     else
     {
         DPrintf(2, ("tcp: %d < min headers %d\n", len, tcpipDataAt));
+        res.xxpFull = FALSE;
+        res.xxpStatus = ppresXxpIncomplete;
     }
     return res;
 }
@@ -178,7 +181,6 @@ ProcessUDPHeader(tTcpIpPacketParsingResult _res, PVOID pIpHeader, ULONG len, USH
 {
     tTcpIpPacketParsingResult res = _res;
     ULONG udpDataStart = ipHeaderSize + sizeof(UDPHeader);
-    res.xxpStatus = ppresXxpIncomplete;
     res.TcpUdp = ppresIsUDP;
     res.XxpIpHeaderSize = udpDataStart;
     if (len >= udpDataStart)
@@ -186,38 +188,70 @@ ProcessUDPHeader(tTcpIpPacketParsingResult _res, PVOID pIpHeader, ULONG len, USH
         UDPHeader *pUdpHeader = (UDPHeader *)RtlOffsetToPointer(pIpHeader, ipHeaderSize);
         USHORT datagramLength = swap_short(pUdpHeader->udp_length);
         res.xxpStatus = ppresXxpKnown;
+        res.xxpFull = TRUE;
         // may be full or not, but the datagram length is known
         DPrintf(2, ("udp: len %d, datagramLength %d\n", len, datagramLength));
+    }
+    else
+    {
+        res.xxpFull = FALSE;
+        res.xxpStatus = ppresXxpIncomplete;
     }
     return res;
 }
 
 static __inline tTcpIpPacketParsingResult
-QualifyIpPacket(IPHeader *pIpHeader, ULONG len)
+QualifyIpPacket(IPHeader *pIpHeader, ULONG len, BOOLEAN verifyLength)
 {
     tTcpIpPacketParsingResult res;
+    res.value = 0;
+
+    if (len < 4)
+    {
+        res.ipStatus = ppresNotIP;
+        return res;
+    }
+
     UCHAR  ver_len = pIpHeader->v4.ip_verlen;
     UCHAR  ip_version = (ver_len & 0xF0) >> 4;
     USHORT ipHeaderSize = 0;
     USHORT fullLength = 0;
     res.value = 0;
-    
+
     if (ip_version == 4)
     {
+        if (len < sizeof(IPv4Header))
+        {
+            res.ipStatus = ppresNotIP;
+            return res;
+        }
         ipHeaderSize = (ver_len & 0xF) << 2;
         fullLength = swap_short(pIpHeader->v4.ip_length);
-        DPrintf(3, ("ip_version %d, ipHeaderSize %d, protocol %d, iplen %d\n",
-            ip_version, ipHeaderSize, pIpHeader->v4.ip_protocol, fullLength));
+        DPrintf(3, ("ip_version %d, ipHeaderSize %d, protocol %d, iplen %d, L2 payload length %d\n",
+            ip_version, ipHeaderSize, pIpHeader->v4.ip_protocol, fullLength, len));
+
         res.ipStatus = (ipHeaderSize >= sizeof(IPv4Header)) ? ppresIPV4 : ppresNotIP;
-        if (len < ipHeaderSize) res.ipCheckSum = ppresIPTooShort;
-        if (fullLength) {}
-        else
+        if (res.ipStatus == ppresNotIP)
         {
-            DPrintf(2, ("ip v.%d, iplen %d\n", ip_version, fullLength));
+            return res;
+        }
+
+        if (ipHeaderSize >= fullLength || ( verifyLength && len < fullLength))
+        {
+            DPrintf(2, ("[%s] - truncated packet - ip_version %d, ipHeaderSize %d, protocol %d, iplen %d, L2 payload length %d, verify = %s\n", __FUNCTION__,
+                ip_version, ipHeaderSize, pIpHeader->v4.ip_protocol, fullLength, len, (verifyLength ? "true" : "false")));
+            res.ipCheckSum = ppresIPTooShort;
+            return res;
         }
     }
     else if (ip_version == 6)
     {
+        if (len < sizeof(IPv6Header))
+        {
+            res.ipStatus = ppresNotIP;
+            return res;
+        }
+
         UCHAR nextHeader = pIpHeader->v6.ip6_next_header;
         BOOLEAN bParsingDone = FALSE;
         ipHeaderSize = sizeof(pIpHeader->v6);
@@ -225,6 +259,12 @@ QualifyIpPacket(IPHeader *pIpHeader, ULONG len)
         res.ipCheckSum = ppresCSOK;
         fullLength = swap_short(pIpHeader->v6.ip6_payload_len);
         fullLength += ipHeaderSize;
+
+        if (verifyLength && (len < fullLength))
+        {
+            res.ipStatus = ppresNotIP;
+            return res;
+        }
         while (nextHeader != 59)
         {
             IPv6ExtHeader *pExt;
@@ -246,11 +286,17 @@ QualifyIpPacket(IPHeader *pIpHeader, ULONG len)
                     break;
                     //existing extended headers
                 case 0:
+                    __fallthrough;
                 case 60:
+                    __fallthrough;
                 case 43:
+                    __fallthrough;
                 case 44:
+                    __fallthrough;
                 case 51:
+                    __fallthrough;
                 case 50:
+                    __fallthrough;
                 case 135:
                     if (len >= ((ULONG)ipHeaderSize + 8))
                     {
@@ -291,7 +337,7 @@ QualifyIpPacket(IPHeader *pIpHeader, ULONG len)
     if (res.ipStatus == ppresIPV4)
     {
         res.ipHeaderSize = ipHeaderSize;
-        res.xxpFull = len >= fullLength ? 1 : 0;
+
         // bit "more fragments" or fragment offset mean the packet is fragmented
         res.IsFragment = (pIpHeader->v4.ip_offset & ~0xC0) != 0;
         switch (pIpHeader->v4.ip_protocol)
@@ -610,11 +656,15 @@ tTcpIpPacketParsingResult ParaNdis_CheckSumVerify(
                                                 ULONG ulDataLength,
                                                 ULONG ulStartOffset,
                                                 ULONG flags,
+                                                BOOLEAN verifyLength,
                                                 LPCSTR caller)
 {
     IPHeader *pIpHeader = (IPHeader *) RtlOffsetToPointer(pDataPages[0].Virtual, ulStartOffset);
 
-    tTcpIpPacketParsingResult res = QualifyIpPacket(pIpHeader, ulDataLength);
+    tTcpIpPacketParsingResult res = QualifyIpPacket(pIpHeader, ulDataLength, verifyLength);
+    if (res.ipStatus == ppresNotIP || res.ipCheckSum == ppresIPTooShort)
+        return res;
+
     if (res.ipStatus == ppresIPV4)
     {
         if (flags & pcrIpChecksum)
@@ -661,9 +711,9 @@ tTcpIpPacketParsingResult ParaNdis_CheckSumVerify(
     return res;
 }
 
-tTcpIpPacketParsingResult ParaNdis_ReviewIPPacket(PVOID buffer, ULONG size, LPCSTR caller)
+tTcpIpPacketParsingResult ParaNdis_ReviewIPPacket(PVOID buffer, ULONG size, BOOLEAN verifyLength, LPCSTR caller)
 {
-    tTcpIpPacketParsingResult res = QualifyIpPacket((IPHeader *) buffer, size);
+    tTcpIpPacketParsingResult res = QualifyIpPacket((IPHeader *) buffer, size, verifyLength);
     PrintOutParsingResult(res, 1, caller);
     return res;
 }
@@ -690,14 +740,17 @@ BOOLEAN AnalyzeL2Hdr(
 
     if (ETH_IS_BROADCAST(dataBuffer))
     {
+        #pragma warning(suppress: 4463)
         packetInfo->isBroadcast = TRUE;
     }
     else if (ETH_IS_MULTICAST(dataBuffer))
     {
+        #pragma warning(suppress: 4463)
         packetInfo->isMulticast = TRUE;
     }
     else
     {
+        #pragma warning(suppress: 4463)
         packetInfo->isUnicast = TRUE;
     }
 
@@ -708,6 +761,7 @@ BOOLEAN AnalyzeL2Hdr(
         if(packetInfo->dataLength < ETH_HEADER_SIZE + ETH_PRIORITY_HEADER_SIZE)
             return FALSE;
 
+        #pragma warning(suppress: 4463)
         packetInfo->hasVlanHeader     = TRUE;
         packetInfo->Vlan.UserPriority = VLAN_GET_USER_PRIORITY(vlanHdr);
         packetInfo->Vlan.VlanId       = VLAN_GET_VLAN_ID(vlanHdr);
@@ -832,8 +886,11 @@ BOOLEAN AnalyzeIP6Hdr(
         {
         default:
         case IP6_HDR_NONE:
+            __fallthrough;
         case PROTOCOL_TCP:
+            __fallthrough;
         case PROTOCOL_UDP:
+            __fallthrough;
         case IP6_HDR_FRAGMENT:
             return TRUE;
         case IP6_HDR_DESTINATON:
@@ -866,8 +923,11 @@ BOOLEAN AnalyzeIP6Hdr(
             }
             break;
         case IP6_HDR_HOP_BY_HOP:
+            __fallthrough;
         case IP6_HDR_ESP:
+            __fallthrough;
         case IP6_HDR_AUTHENTICATION:
+            __fallthrough;
         case IP6_HDR_MOBILITY:
             if(!SkipIP6ExtensionHeader(ip6Hdr, dataLength, ip6HdrLength, nextHdr))
                 return FALSE;

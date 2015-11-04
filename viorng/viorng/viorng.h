@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2014 Red Hat, Inc.
+ * Copyright (C) 2014-2015 Red Hat, Inc.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -52,6 +52,7 @@
 #include "virtio_pci.h"
 #pragma warning(pop)
 
+#include "virtio_config.h"
 #include "virtio.h"
 
 #define VIRT_RNG_MEMORY_TAG ((ULONG)'gnrV')

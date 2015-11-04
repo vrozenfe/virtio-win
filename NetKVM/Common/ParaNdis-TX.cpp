@@ -1,4 +1,5 @@
 #include "ndis56common.h"
+#include "kdebugprint.h"
 
 CNBL::CNBL(PNET_BUFFER_LIST NBL, PPARANDIS_ADAPTER Context, CParaNdisTX &ParentTXPath)
     : m_NBL(NBL)
@@ -352,6 +353,10 @@ void CNBL::CompleteMappedBuffers()
 
 PNET_BUFFER_LIST CNBL::DetachInternalObject()
 {
+    m_MappedBuffers.ForEach([this](CNB *NB)
+    {
+        NB->ReleaseResources();
+    });
 
     // do it for both LsoV1 and LsoV2
     if (IsLSO())
@@ -462,6 +467,7 @@ BOOLEAN _Function_class_(MINIPORT_SYNCHRONIZE_INTERRUPT) CParaNdisTX::RestartQue
 //TODO: Requires review
 bool CParaNdisTX::RestartQueue(bool DoKick)
 {
+    TSpinLocker LockedContext(m_Lock);
     auto res = ParaNdis_SynchronizeWithInterrupt(m_Context,
                                                  m_messageIndex,
                                                  CParaNdisTX::RestartQueueSynchronously,
@@ -475,7 +481,7 @@ bool CParaNdisTX::RestartQueue(bool DoKick)
     return res;
 }
 
-bool CParaNdisTX::SendMapped(PNET_BUFFER_LIST &NBLFailNow)
+bool CParaNdisTX::SendMapped(bool IsInterrupt, PNET_BUFFER_LIST &NBLFailNow)
 {
     if(!ParaNdis_IsSendPossible(m_Context))
     {
@@ -509,7 +515,9 @@ bool CParaNdisTX::SendMapped(PNET_BUFFER_LIST &NBLFailNow)
                     break;
 
                 case SUBMIT_FAILURE:
+                    __fallthrough;
                 case SUBMIT_SUCCESS:
+                    __fallthrough;
                 case SUBMIT_PACKET_TOO_LARGE:
                     // if this NBL finished?
                     if (!NBLHolder->HaveMappedBuffers())
@@ -549,7 +557,14 @@ bool CParaNdisTX::SendMapped(PNET_BUFFER_LIST &NBLFailNow)
         if (SentOutSomeBuffers)
         {
             DPrintf(2, ("[%s] sent down\n", __FUNCTION__, SentOutSomeBuffers));
-            return true;
+            if (IsInterrupt)
+            {
+                return true;
+            }
+            else
+            {
+                m_VirtQueue.Kick();
+            }
         }
     }
 
@@ -566,14 +581,22 @@ bool CParaNdisTX::DoPendingTasks(bool IsInterrupt)
     DoWithTXLock([&] ()
                  {
                     m_VirtQueue.ProcessTXCompletions();
-                    bDoKick = SendMapped(pNBLFailNow);
+                    bDoKick = SendMapped(IsInterrupt, pNBLFailNow);
                     pNBLReturnNow = ProcessWaitingList();
-
-                    if (!m_VirtQueue.HasPacketsInHW() && m_Context->SendState == srsPausing)
                     {
-                        CallbackToCall = m_Context->SendPauseCompletionProc;
-                        m_Context->SendPauseCompletionProc = nullptr;
-                        m_Context->SendState = srsDisabled;
+                        NdisDprAcquireSpinLock(&m_Context->m_CompletionLock);
+
+                        if (m_Context->SendState == srsPausing)
+                        {
+                            CNdisPassiveWriteAutoLock tLock(m_Context->m_PauseLock);
+
+                            if (m_Context->SendState == srsPausing && !ParaNdis_HasPacketsInHW(m_Context))
+                            {
+                                CallbackToCall = m_Context->SendPauseCompletionProc;
+                                m_Context->SendPauseCompletionProc = nullptr;
+                                m_Context->SendState = srsDisabled;
+                            }
+                        }
                     }
                  });
 
@@ -589,15 +612,12 @@ bool CParaNdisTX::DoPendingTasks(bool IsInterrupt)
                                         NDIS_SEND_COMPLETE_FLAGS_DISPATCH_LEVEL);
     }
 
+#pragma warning(suppress: 26110)
+    NdisDprReleaseSpinLock(&m_Context->m_CompletionLock);
+
     if (CallbackToCall != nullptr)
     {
         CallbackToCall(m_Context);
-    }
-
-    if (bDoKick && !IsInterrupt)
-    {
-        Kick();
-        bDoKick = false;
     }
 
     return bDoKick;
@@ -619,6 +639,15 @@ CNB::~CNB()
     }
 }
 
+void CNB::ReleaseResources()
+{
+    if (m_SGL != nullptr)
+    {
+        NdisMFreeNetBufferSGList(m_Context->DmaHandle, m_SGL, m_NB);
+        m_SGL = nullptr;
+    }
+}
+
 bool CNB::ScheduleBuildSGListForTx()
 {
     ASSERT(KeGetCurrentIrql() == DISPATCH_LEVEL);
@@ -627,29 +656,42 @@ bool CNB::ScheduleBuildSGListForTx()
                                         NDIS_SG_LIST_WRITE_TO_DEVICE, nullptr, 0) == NDIS_STATUS_SUCCESS;
 }
 
-void CNB::PopulateIPLength(IPv4Header *IpHeader, USHORT IpLength) const
+void CNB::PopulateIPLength(IPHeader *IpHeader, USHORT IpLength) const
 {
-    if ((IpHeader->ip_verlen & 0xF0) == 0x40)
+    if ((IpHeader->v4.ip_verlen & 0xF0) == 0x40)
     {
-        if (!IpHeader->ip_length) {
-            IpHeader->ip_length = swap_short(IpLength);
+        if (!IpHeader->v4.ip_length)
+        {
+            IpHeader->v4.ip_length = swap_short(IpLength);
         }
+    }
+    else if ((IpHeader->v6.ip6_ver_tc & 0xF0) == 0x60)
+    {
+        if (!IpHeader->v6.ip6_payload_len)
+        {
+            IpHeader->v6.ip6_payload_len = swap_short(IpLength - IPV6_HEADER_MIN_SIZE);
+        }
+    }
+    else
+    {
+        DPrintf(0, ("[%s] ERROR: Bad version of IP header!\n", __FUNCTION__));
     }
 }
 
-void CNB::SetupLSO(virtio_net_hdr_basic *VirtioHeader, PVOID IpHeader, ULONG EthPayloadLength) const
+void CNB::SetupLSO(virtio_net_hdr *VirtioHeader, PVOID IpHeader, ULONG EthPayloadLength) const
 {
-    PopulateIPLength(reinterpret_cast<IPv4Header*>(IpHeader), static_cast<USHORT>(EthPayloadLength));
+    PopulateIPLength(reinterpret_cast<IPHeader*>(IpHeader), static_cast<USHORT>(EthPayloadLength));
 
     tTcpIpPacketParsingResult packetReview;
     packetReview = ParaNdis_CheckSumVerifyFlat(reinterpret_cast<IPv4Header*>(IpHeader), EthPayloadLength,
                                                pcrIpChecksum | pcrFixIPChecksum | pcrTcpChecksum | pcrFixPHChecksum,
+                                               FALSE,
                                                __FUNCTION__);
 
     if (packetReview.xxpCheckSum == ppresPCSOK || packetReview.fixedXxpCS)
     {
         auto IpHeaderOffset = m_Context->Offload.ipHeaderOffset;
-        auto VHeader = static_cast<virtio_net_hdr_basic*>(VirtioHeader);
+        auto VHeader = static_cast<virtio_net_hdr*>(VirtioHeader);
         auto PriorityHdrLen = (m_ParentNBL->TCI() != 0) ? ETH_PRIORITY_HEADER_SIZE : 0;
 
         VHeader->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
@@ -665,7 +707,7 @@ USHORT CNB::QueryL4HeaderOffset(PVOID PacketData, ULONG IpHeaderOffset) const
 {
     USHORT Res;
     auto ppr = ParaNdis_ReviewIPPacket(RtlOffsetToPointer(PacketData, IpHeaderOffset),
-                                       GetDataLength(), __FUNCTION__);
+                                       GetDataLength(), FALSE, __FUNCTION__);
     if (ppr.ipStatus != ppresNotIP)
     {
         Res = static_cast<USHORT>(IpHeaderOffset + ppr.ipHeaderSize);
@@ -678,7 +720,7 @@ USHORT CNB::QueryL4HeaderOffset(PVOID PacketData, ULONG IpHeaderOffset) const
     return Res;
 }
 
-void CNB::SetupCSO(virtio_net_hdr_basic *VirtioHeader, ULONG L4HeaderOffset) const
+void CNB::SetupCSO(virtio_net_hdr *VirtioHeader, ULONG L4HeaderOffset) const
 {
     u16 PriorityHdrLen = m_ParentNBL->TCI() ? ETH_PRIORITY_HEADER_SIZE : 0;
 
@@ -691,7 +733,7 @@ void CNB::DoIPHdrCSO(PVOID IpHeader, ULONG EthPayloadLength) const
 {
     ParaNdis_CheckSumVerifyFlat(IpHeader,
                                 EthPayloadLength,
-                                pcrIpChecksum | pcrFixIPChecksum,
+                                pcrIpChecksum | pcrFixIPChecksum, FALSE,
                                 __FUNCTION__);
 }
 
@@ -769,7 +811,7 @@ void CNB::BuildPriorityHeader(PETH_HEADER EthHeader, PVLAN_HEADER VlanHeader) co
     }
 }
 
-void CNB::PrepareOffloads(virtio_net_hdr_basic *VirtioHeader, PVOID IpHeader, ULONG EthPayloadLength, ULONG L4HeaderOffset) const
+void CNB::PrepareOffloads(virtio_net_hdr *VirtioHeader, PVOID IpHeader, ULONG EthPayloadLength, ULONG L4HeaderOffset) const
 {
     *VirtioHeader = {};
 

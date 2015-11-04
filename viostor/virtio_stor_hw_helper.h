@@ -1,5 +1,5 @@
 /**********************************************************************
- * Copyright (c) 2008  Red Hat, Inc.
+ * Copyright (c) 2008-2015 Red Hat, Inc.
  *
  * File: virtio_stor_hw_helper.h
  *
@@ -27,6 +27,7 @@
 
 #include "osdep.h"
 #include "virtio_pci.h"
+#include "virtio_config.h"
 #include "virtio.h"
 #include "virtio_stor.h"
 

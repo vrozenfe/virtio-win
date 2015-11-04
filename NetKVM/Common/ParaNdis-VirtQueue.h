@@ -3,14 +3,15 @@
 extern "C"
 {
 
-#include <ndis.h>
 #include "osdep.h"
 #include "virtio_pci.h"
-#include "VirtIO.h"
+#include "virtio.h"
 
+#include "ethernetutils.h"
 }
 
 #include "ParaNdis-Util.h"
+#include "virtio_net.h"
 
 class CNB;
 typedef struct _tagPARANDIS_ADAPTER *PPARANDIS_ADAPTER;
@@ -37,8 +38,8 @@ public:
 
     bool Allocate();
 
-    virtio_net_hdr_basic *VirtioHeader() const
-    { return static_cast<virtio_net_hdr_basic*>(m_VirtioHeaderVA); }
+    virtio_net_hdr *VirtioHeader() const
+    { return static_cast<virtio_net_hdr*>(m_VirtioHeaderVA); }
     ULONG VirtioHeaderLength() const
     { return m_VirtioHdrSize; }
     PETH_HEADER EthHeader() const
@@ -255,11 +256,7 @@ public:
     //TODO: Needs review / temporary
     void Kick()
     {
-#ifdef PARANDIS_TEST_TX_KICK_ALWAYS
-        virtqueue_notify(m_VirtQueue);
-#else
         virtqueue_kick(m_VirtQueue);
-#endif
     }
 
     //TODO: Needs review / temporary
@@ -268,10 +265,6 @@ public:
 
     bool HasPacketsInHW()
     { return !m_DescriptorsInUse.IsEmpty(); }
-
-    //TODO: Needs review
-    bool HasHWBuffersIsUse()
-    { return m_FreeHWBuffers != m_TotalHWBuffers; }
 
     //TODO: Needs review/temporary?
     void EnableInterrupts()

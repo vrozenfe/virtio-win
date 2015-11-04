@@ -1,12 +1,19 @@
 #include "ndis56common.h"
+#include "kdebugprint.h"
+#include "ParaNdis_DebugHistory.h"
 
 CParaNdisRX::CParaNdisRX() : m_nReusedRxBuffersCounter(0), m_NetNofReceiveBuffers(0)
 {
     InitializeListHead(&m_NetReceiveBuffers);
+
+    NdisAllocateSpinLock(&m_UnclassifiedPacketsQueue.Lock);
+    InitializeListHead(&m_UnclassifiedPacketsQueue.BuffersList);
+    m_UnclassifiedPacketsQueue.ActiveProcessorsCount = 0;
 }
 
 CParaNdisRX::~CParaNdisRX()
 {
+    NdisFreeSpinLock(&m_UnclassifiedPacketsQueue.Lock);
 }
 
 bool CParaNdisRX::Create(PPARANDIS_ADAPTER Context, UINT DeviceQueueIndex)
@@ -56,6 +63,7 @@ int CParaNdisRX::PrepareReceiveBuffers()
     /* TODO - NetMaxReceiveBuffers should take into account all queues */
     m_Context->NetMaxReceiveBuffers = m_NetNofReceiveBuffers;
     DPrintf(0, ("[%s] MaxReceiveBuffers %d\n", __FUNCTION__, m_Context->NetMaxReceiveBuffers));
+    m_Reinsert = true;
 
     m_VirtQueue.Kick();
 
@@ -132,17 +140,21 @@ void CParaNdisRX::FreeRxDescriptorsFromList()
     }
 }
 
-void CParaNdisRX::ReuseReceiveBufferRegular(pRxNetDescriptor pBuffersDescriptor)
+void CParaNdisRX::ReuseReceiveBufferNoLock(pRxNetDescriptor pBuffersDescriptor)
 {
     DEBUG_ENTRY(4);
 
-    if (!pBuffersDescriptor)
-        return;
+    m_Context->m_rxPacketsOutsideRing.Release();
 
-    m_Context->m_upstreamPacketPending.Release();
-
-    if (AddRxBufferToQueue(pBuffersDescriptor))
+    if (!m_Reinsert)
     {
+        InsertTailList(&m_NetReceiveBuffers, &pBuffersDescriptor->listEntry);
+        m_NetNofReceiveBuffers++;
+        return;
+    } 
+    else if (AddRxBufferToQueue(pBuffersDescriptor))
+    {
+        InsertTailList(&m_NetReceiveBuffers, &pBuffersDescriptor->listEntry);
         m_NetNofReceiveBuffers++;
 
         if (m_NetNofReceiveBuffers > m_Context->NetMaxReceiveBuffers)
@@ -157,19 +169,6 @@ void CParaNdisRX::ReuseReceiveBufferRegular(pRxNetDescriptor pBuffersDescriptor)
             m_nReusedRxBuffersCounter = 0;
             m_VirtQueue.KickAlways();
         }
-
-        /* TODO -  the callback dispatch should be performed as a context method */
-        if (m_Context->m_upstreamPacketPending == 0)
-        {
-            if (m_Context->ReceiveState == srsPausing || m_Context->ReceivePauseCompletionProc)
-            {
-                ONPAUSECOMPLETEPROC callback = m_Context->ReceivePauseCompletionProc;
-                m_Context->ReceiveState = srsDisabled;
-                m_Context->ReceivePauseCompletionProc = NULL;
-                ParaNdis_DebugHistory(m_Context, hopInternalReceivePause, NULL, 0, 0, 0);
-                if (callback) callback(m_Context);
-            }
-        }
     }
     else
     {
@@ -180,26 +179,25 @@ void CParaNdisRX::ReuseReceiveBufferRegular(pRxNetDescriptor pBuffersDescriptor)
     }
 }
 
-void CParaNdisRX::ReuseReceiveBufferPowerOff(pRxNetDescriptor)
-{
-    m_Context->m_upstreamPacketPending.Release();
-}
-
 VOID CParaNdisRX::ProcessRxRing(CCHAR nCurrCpuReceiveQueue)
 {
     pRxNetDescriptor pBufferDescriptor;
     unsigned int nFullLength;
 
+#ifndef PARANDIS_SUPPORT_RSS
+    UNREFERENCED_PARAMETER(nCurrCpuReceiveQueue);
+#endif
+
     CLockedContext<CNdisSpinLock> autoLock(m_Lock);
 
     while (NULL != (pBufferDescriptor = (pRxNetDescriptor)m_VirtQueue.GetBuf(&nFullLength)))
     {
-        CCHAR nTargetReceiveQueueNum;
-        GROUP_AFFINITY TargetAffinity;
-        PROCESSOR_NUMBER TargetProcessor;
+        /* The counter m_rxPacketsOutsideRing is increased when the packet is removed from ring; it is decreased
+        in CParaNdisRX::ReuseReceiveBuffer either in case of error or when NDIS calls ParaNdis6_ReturnNetBufferLists
+        indicating the return of a receive buffer under miniport driver ownership */
 
-        m_Context->m_upstreamPacketPending.AddRef();
-
+        m_Context->m_rxPacketsOutsideRing.AddRef();
+        RemoveEntryList(&pBufferDescriptor->listEntry);
         m_NetNofReceiveBuffers--;
 
         BOOLEAN packetAnalyzisRC;
@@ -215,31 +213,47 @@ VOID CParaNdisRX::ProcessRxRing(CCHAR nCurrCpuReceiveQueue)
 
         if (!packetAnalyzisRC)
         {
-            pBufferDescriptor->Queue->ReuseReceiveBufferNoLock(m_Context->ReuseBufferRegular, pBufferDescriptor);
+            pBufferDescriptor->Queue->ReuseReceiveBufferNoLock(pBufferDescriptor);
             m_Context->Statistics.ifInErrors++;
             m_Context->Statistics.ifInDiscards++;
             continue;
         }
+
+#ifdef PARANDIS_SUPPORT_RSS
+        CCHAR nTargetReceiveQueueNum;
+        GROUP_AFFINITY TargetAffinity;
+        PROCESSOR_NUMBER TargetProcessor;
 
         nTargetReceiveQueueNum = ParaNdis_GetScalingDataForPacket(
             m_Context,
             &pBufferDescriptor->PacketInfo,
             &TargetProcessor);
 
-        ParaNdis_ReceiveQueueAddBuffer(&m_Context->ReceiveQueues[nTargetReceiveQueueNum], pBufferDescriptor);
-        ParaNdis_ProcessorNumberToGroupAffinity(&TargetAffinity, &TargetProcessor);
-
-        if ((nTargetReceiveQueueNum != PARANDIS_RECEIVE_QUEUE_UNCLASSIFIED) &&
-            (nTargetReceiveQueueNum != nCurrCpuReceiveQueue))
+        if (nTargetReceiveQueueNum == PARANDIS_RECEIVE_UNCLASSIFIED_PACKET)
         {
-            ParaNdis_QueueRSSDpc(m_Context, m_messageIndex, &TargetAffinity);
+            ParaNdis_ReceiveQueueAddBuffer(&m_UnclassifiedPacketsQueue, pBufferDescriptor);
         }
+        else
+        {
+            ParaNdis_ReceiveQueueAddBuffer(&m_Context->ReceiveQueues[nTargetReceiveQueueNum], pBufferDescriptor);
+
+            if (nTargetReceiveQueueNum != nCurrCpuReceiveQueue)
+            {
+                ParaNdis_ProcessorNumberToGroupAffinity(&TargetAffinity, &TargetProcessor);
+                ParaNdis_QueueRSSDpc(m_Context, m_messageIndex, &TargetAffinity);
+            }
+        }
+#else
+       ParaNdis_ReceiveQueueAddBuffer(&m_UnclassifiedPacketsQueue, pBufferDescriptor);
+#endif
     }
 }
 
 void CParaNdisRX::PopulateQueue()
 {
     LIST_ENTRY TempList;
+    CLockedContext<CNdisSpinLock> autoLock(m_Lock);
+
 
     InitializeListHead(&TempList);
 
@@ -267,6 +281,8 @@ void CParaNdisRX::PopulateQueue()
             m_Context->NetMaxReceiveBuffers--;
         }
     }
+    m_Reinsert = true;
+
     m_VirtQueue.Kick();
 }
 

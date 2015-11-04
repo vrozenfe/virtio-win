@@ -16,9 +16,11 @@
  */
 #include "osdep.h"
 #include "VirtIO_PCI.h"
-#include "VirtIO.h"
+#include "virtio_config.h"
+#include "virtio.h"
 #include "kdebugprint.h"
 #include "VirtIO_Ring.h"
+#include "windows\virtio_ring_allocation.h"
 
 #ifdef WPP_EVENT_TRACING
 #include "VirtIOPCI.tmh"

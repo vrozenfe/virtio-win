@@ -1,5 +1,5 @@
 /**********************************************************************
- * Copyright (c) 2008  Red Hat, Inc.
+ * Copyright (c) 2008-2015 Red Hat, Inc.
  *
  * File: virtio_stor.h
  *
@@ -24,7 +24,9 @@
 
 #include "osdep.h"
 #include "virtio_pci.h"
-#include "VirtIO.h"
+#include "virtio_config.h"
+#include "virtio.h"
+#include "virtio_ring.h"
 
 typedef struct VirtIOBufferDescriptor VIO_SG, *PVIO_SG;
 
@@ -125,11 +127,11 @@ typedef struct _ADAPTER_EXTENSION {
     BOOLEAN               sn_ok;
     blk_req               vbr;
     BOOLEAN               indirect;
+    ULONGLONG             lastLBA;
 #ifdef USE_STORPORT
     LIST_ENTRY            complete_list;
     STOR_DPC              completion_dpc;
     BOOLEAN               dpc_ok;
-    ULONG                 in_fly;
 #endif
 }ADAPTER_EXTENSION, *PADAPTER_EXTENSION;
 

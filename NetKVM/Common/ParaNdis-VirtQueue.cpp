@@ -1,5 +1,6 @@
 #include "ndis56common.h"
 #include "ParaNdis-VirtQueue.h"
+#include "kdebugprint.h"
 
 bool CVirtQueue::AllocateQueueMemory()
 {
@@ -226,8 +227,10 @@ SubmitTxPacketResult CTXVirtQueue::SubmitPacket(CNB &NB)
         {
             KickQueueOnOverflow();
             //Fall-through
+            __fallthrough;
         }
         case SUBMIT_PACKET_TOO_LARGE:
+            __fallthrough;
         case SUBMIT_FAILURE:
         {
             m_Descriptors.Push(TXDescriptor);
@@ -270,7 +273,6 @@ UINT CTXVirtQueue::VirtIONetReleaseTransmitBuffers()
     {
         NdisGetCurrentSystemTime(&m_Context->LastTxCompletionTimeStamp);
         m_DoKickOnNoBuffer = true;
-        m_Context->nDetectedStoppedTx = 0;
     }
     DPrintf((i ? 3 : 5), ("[%s] returning i = %d\n", __FUNCTION__, i)); 
     return i;

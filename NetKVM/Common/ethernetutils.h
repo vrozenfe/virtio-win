@@ -1,5 +1,5 @@
 /**********************************************************************
- * Copyright (c) 2008  Red Hat, Inc.
+ * Copyright (c) 2008-2015 Red Hat, Inc.
  *
  * File: ethernetutils.h
  *
@@ -13,7 +13,7 @@
 #define _ETHERNET_UTILS_H
 
 // assuming <ndis.h> included
-
+#include <linux/if_ether.h>
 
 #define ETH_IS_LOCALLY_ADMINISTERED(Address) \
         (BOOLEAN)(((PUCHAR)(Address))[0] & ((UCHAR)0x02))
@@ -29,8 +29,8 @@
 #include <pshpack1.h>
 typedef struct _ETH_HEADER
 {
-    UCHAR   DstAddr[ETH_LENGTH_OF_ADDRESS];
-    UCHAR   SrcAddr[ETH_LENGTH_OF_ADDRESS];
+    UCHAR   DstAddr[ETH_ALEN];
+    UCHAR   SrcAddr[ETH_ALEN];
     USHORT  EthType;
 } ETH_HEADER, *PETH_HEADER;
 
@@ -81,6 +81,8 @@ typedef union
     IPv6Header v6;
     IPv4Header v4;
 } IPHeader;
+
+#define IPV6_HEADER_MIN_SIZE                (sizeof(IPv6Header))
 
 // TCP header RFC 793
 typedef struct _tagTCPHeader {

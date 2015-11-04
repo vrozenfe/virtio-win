@@ -1,3 +1,4 @@
+#pragma once
 #include "ParaNdis-VirtQueue.h"
 #include "ParaNdis-AbstractPath.h"
 
@@ -39,7 +40,10 @@ public:
     bool IsSendDone();
 
     UCHAR ProtocolID()
-    { return reinterpret_cast<UCHAR>(NET_BUFFER_LIST_INFO(m_NBL, NetBufferListProtocolId)); }
+    {
+        #pragma warning(suppress: 4302)
+        return reinterpret_cast<UCHAR>(NET_BUFFER_LIST_INFO(m_NBL, NetBufferListProtocolId));
+    }
     bool MatchCancelID(PVOID ID)
     { return NDIS_GET_NET_BUFFER_LIST_CANCEL_ID(m_NBL) == ID; }
     ULONG MSS()
@@ -138,6 +142,7 @@ public:
     bool ScheduleBuildSGListForTx();
 
     void MappingDone(PSCATTER_GATHER_LIST SGL);
+    void ReleaseResources();
 
     CNBL *GetParentNBL() const
     { return m_ParentNBL; }
@@ -156,14 +161,14 @@ private:
     bool Copy(PVOID Dst, ULONG Length) const;
     bool CopyHeaders(PVOID Destination, ULONG MaxSize, ULONG &HeadersLength, ULONG &L4HeaderOffset) const;
     void BuildPriorityHeader(PETH_HEADER EthHeader, PVLAN_HEADER VlanHeader) const;
-    void PrepareOffloads(virtio_net_hdr_basic *VirtioHeader, PVOID IpHeader, ULONG EthPayloadLength, ULONG L4HeaderOffset) const;
-    void SetupLSO(virtio_net_hdr_basic *VirtioHeader, PVOID IpHeader, ULONG EthPayloadLength) const;
+    void PrepareOffloads(virtio_net_hdr *VirtioHeader, PVOID IpHeader, ULONG EthPayloadLength, ULONG L4HeaderOffset) const;
+    void SetupLSO(virtio_net_hdr *VirtioHeader, PVOID IpHeader, ULONG EthPayloadLength) const;
     USHORT QueryL4HeaderOffset(PVOID PacketData, ULONG IpHeaderOffset) const;
     void DoIPHdrCSO(PVOID EthHeaders, ULONG HeadersLength) const;
-    void SetupCSO(virtio_net_hdr_basic *VirtioHeader, ULONG L4HeaderOffset) const;
+    void SetupCSO(virtio_net_hdr *VirtioHeader, ULONG L4HeaderOffset) const;
     bool FillDescriptorSGList(CTXDescriptor &Descriptor, ULONG DataOffset) const;
     bool MapDataToVirtioSGL(CTXDescriptor &Descriptor, ULONG Offset) const;
-    void PopulateIPLength(IPv4Header *IpHeader, USHORT IpLength) const;
+    void PopulateIPLength(IPHeader *IpHeader, USHORT IpLength) const;
 
     PNET_BUFFER m_NB;
     CNBL *m_ParentNBL;
@@ -211,36 +216,6 @@ public:
     //TODO: Requires review
     static BOOLEAN _Function_class_(MINIPORT_SYNCHRONIZE_INTERRUPT) RestartQueueSynchronously(tSynchronizedContext *ctx);
 
-    //TODO: Needs review/temporary!!!
-    bool HasHWBuffersIsUse()
-    {
-        TSpinLocker LockedContext(m_Lock);
-        return m_VirtQueue.HasHWBuffersIsUse();
-    }
-
-    //TODO: Needs review/temporary!!!
-    void Shutdown()
-    {
-        TSpinLocker LockedContext(m_Lock);
-        m_VirtQueue.Shutdown();
-    }
-
-    //TODO: Needs review/temporary?
-    void EnableInterrupts()
-    { m_VirtQueue.EnableInterrupts(); }
-
-    //TODO: Needs review/temporary?
-    void DisableInterrupts()
-    { m_VirtQueue.DisableInterrupts(); }
-
-    //TODO: Needs review/temporary?
-    bool IsInterruptEnabled()
-    { return m_VirtQueue.IsInterruptEnabled(); }
-
-    //TODO: Needs review/Temporary?
-    void Renew()
-    { m_VirtQueue.Renew(); }
-
     //TODO: Needs review/temporary?
     ULONG GetFreeTXDescriptors()
     { return m_VirtQueue.GetFreeTXDescriptors(); }
@@ -252,10 +227,15 @@ public:
     //TODO: Needs review
     bool DoPendingTasks(bool IsInterrupt);
 
+    bool QueueHasPacketInHW()
+    {
+        return m_VirtQueue.HasPacketsInHW();
+    }
+
 private:
 
     //TODO: Needs review
-    bool SendMapped(PNET_BUFFER_LIST &NBLFailNow);
+    bool SendMapped(bool IsInterrupt, PNET_BUFFER_LIST &NBLFailNow);
 
     PNET_BUFFER_LIST ProcessWaitingList();
     PNET_BUFFER_LIST BuildCancelList(PVOID CancelId);

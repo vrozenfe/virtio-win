@@ -1,5 +1,5 @@
 /**********************************************************************
- * Copyright (c) 2008  Red Hat, Inc.
+ * Copyright (c) 2008-2015 Red Hat, Inc.
  *
  * File: virtio_stor.c
  *
@@ -341,17 +341,18 @@ VirtIoFindAdapter(
     {
         UCHAR CapOffset;
         PPCI_MSIX_CAPABILITY pMsixCapOffset;
-
+        PPCI_COMMON_HEADER   pPciComHeader;
+        pPciComHeader = (PPCI_COMMON_HEADER)pci_cfg_buf;
         pPciConf = (PPCI_COMMON_CONFIG)pci_cfg_buf;
-        if ( (pPciConf->Status & PCI_STATUS_CAPABILITIES_LIST) == 0)
+        if ( (pPciComHeader->Status & PCI_STATUS_CAPABILITIES_LIST) == 0)
         {
            RhelDbgPrint(TRACE_LEVEL_INFORMATION, ("NO CAPABILITIES_LIST\n"));
         }
         else
         {
-           if ( (pPciConf->HeaderType & (~PCI_MULTIFUNCTION)) == PCI_DEVICE_TYPE )
+           if ( (pPciComHeader->HeaderType & (~PCI_MULTIFUNCTION)) == PCI_DEVICE_TYPE )
            {
-              CapOffset = pPciConf->u.type0.CapabilitiesPtr;
+              CapOffset = pPciComHeader->u.type0.CapabilitiesPtr;
               while (CapOffset != 0)
               {
                  pMsixCapOffset = (PPCI_MSIX_CAPABILITY)(pci_cfg_buf + CapOffset);
@@ -395,12 +396,6 @@ VirtIoFindAdapter(
 
     adaptExt->features = ReadVirtIODeviceRegister(adaptExt->vdev.addr + VIRTIO_PCI_HOST_FEATURES);
     ConfigInfo->CachesData = CHECKBIT(adaptExt->features, VIRTIO_BLK_F_WCACHE) ? TRUE : FALSE;
-    if (ConfigInfo->CachesData) {
-        u32 GuestFeatures = 0;
-        VirtIOFeatureEnable(GuestFeatures, VIRTIO_BLK_F_WCACHE);
-
-        VirtIODeviceWriteGuestFeatures(&adaptExt->vdev, GuestFeatures);
-    }
     RhelDbgPrint(TRACE_LEVEL_INFORMATION, ("VIRTIO_BLK_F_WCACHE = %d\n", ConfigInfo->CachesData));
 
     VirtIODeviceQueryQueueAllocation(&adaptExt->vdev, 0, &pageNum, &allocationSize);
@@ -468,10 +463,11 @@ static struct virtqueue *FindVirtualQueue(PADAPTER_EXTENSION adaptExt, ULONG ind
     if (adaptExt->uncachedExtensionVa)
     {
         ULONG len;
+        BOOLEAN useEventIndex = CHECKBIT(adaptExt->features, VIRTIO_RING_F_EVENT_IDX);
         PHYSICAL_ADDRESS pa = ScsiPortGetPhysicalAddress(adaptExt, NULL, adaptExt->uncachedExtensionVa, &len);
         if (pa.QuadPart)
         {
-            vq = VirtIODevicePrepareQueue(&adaptExt->vdev, index, pa, adaptExt->uncachedExtensionVa, len, NULL, FALSE);
+            vq = VirtIODevicePrepareQueue(&adaptExt->vdev, index, pa, adaptExt->uncachedExtensionVa, len, NULL, useEventIndex);
         }
     }
 
@@ -508,6 +504,8 @@ VirtIoHwInitialize(
 
     PADAPTER_EXTENSION adaptExt;
     BOOLEAN            ret = FALSE;
+    ULONG              guestFeatures = 0;
+
 #ifdef MSI_SUPPORTED
     MESSAGE_INTERRUPT_INFORMATION msi_info;
 #endif
@@ -518,6 +516,41 @@ VirtIoHwInitialize(
 
     adaptExt->msix_vectors = 0;
 #ifdef MSI_SUPPORTED
+
+    if (CHECKBIT(adaptExt->features, VIRTIO_RING_F_EVENT_IDX)) {
+        guestFeatures |= (1ul << VIRTIO_RING_F_EVENT_IDX);
+    }
+
+    if (CHECKBIT(adaptExt->features, VIRTIO_BLK_F_WCACHE)) {
+        guestFeatures |= (1ul << VIRTIO_BLK_F_WCACHE);
+    }
+
+    if (CHECKBIT(adaptExt->features, VIRTIO_BLK_F_BARRIER)) {
+        guestFeatures |= (1ul << VIRTIO_BLK_F_BARRIER);
+    }
+
+    if (CHECKBIT(adaptExt->features, VIRTIO_BLK_F_RO)) {
+        guestFeatures |= (1ul << VIRTIO_BLK_F_RO);
+    }
+
+    if (CHECKBIT(adaptExt->features, VIRTIO_BLK_F_SIZE_MAX)) {
+        guestFeatures |= (1ul << VIRTIO_BLK_F_SIZE_MAX);
+    }
+
+    if (CHECKBIT(adaptExt->features, VIRTIO_BLK_F_SEG_MAX)) {
+        guestFeatures |= (1ul << VIRTIO_BLK_F_SEG_MAX);
+    }
+
+    if (CHECKBIT(adaptExt->features, VIRTIO_BLK_F_BLK_SIZE)) {
+        guestFeatures |= (1ul << VIRTIO_BLK_F_BLK_SIZE);
+    }
+
+    if (CHECKBIT(adaptExt->features, VIRTIO_BLK_F_GEOMETRY)) {
+        guestFeatures |= (1ul << VIRTIO_BLK_F_GEOMETRY);
+    }
+
+    ScsiPortWritePortUlong((PULONG)(adaptExt->vdev.addr + VIRTIO_PCI_GUEST_FEATURES), guestFeatures);
+
     while(StorPortGetMSIInfo(DeviceExtension, adaptExt->msix_vectors, &msi_info) == STOR_STATUS_SUCCESS) {
         RhelDbgPrint(TRACE_LEVEL_INFORMATION, ("MessageId = %x\n", msi_info.MessageId));
         RhelDbgPrint(TRACE_LEVEL_INFORMATION, ("MessageData = %x\n", msi_info.MessageData));
@@ -749,16 +782,10 @@ VirtIoInterrupt(
               }
            }
            if (vbr->out_hdr.type == VIRTIO_BLK_T_FLUSH) {
-#ifdef USE_STORPORT
-              --adaptExt->in_fly;
-#endif
               CompleteSRB(DeviceExtension, Srb);
            } else if (vbr->out_hdr.type == VIRTIO_BLK_T_GET_ID) {
               adaptExt->sn_ok = TRUE;
            } else if (Srb) {
-#ifdef USE_STORPORT
-              --adaptExt->in_fly;
-#endif
               srbExt = (PRHEL_SRB_EXTENSION)Srb->SrbExtension;
               if (srbExt->fua) {
                   RemoveEntryList(&vbr->list_entry);
@@ -779,11 +806,6 @@ VirtIoInterrupt(
         RhelGetDiskGeometry(DeviceExtension);
         isInterruptServiced = TRUE;
     }
-#ifdef USE_STORPORT
-    if (adaptExt->in_fly > 0) {
-        virtqueue_kick(adaptExt->vq);
-    }
-#endif
     RhelDbgPrint(TRACE_LEVEL_VERBOSE, ("%s isInterruptServiced = %d\n", __FUNCTION__, isInterruptServiced));
     return isInterruptServiced;
 }
@@ -876,6 +898,8 @@ VirtIoBuildIo(
     PADAPTER_EXTENSION    adaptExt;
     PRHEL_SRB_EXTENSION   srbExt;
     PSTOR_SCATTER_GATHER_LIST sgList;
+    ULONGLONG             lba;
+    ULONG                 blocks;
 
     cdb      = (PCDB)&Srb->Cdb[0];
     srbExt   = (PRHEL_SRB_EXTENSION)Srb->SrbExtension;
@@ -909,6 +933,20 @@ VirtIoBuildIo(
         }
     }
 
+    lba = RhelGetLba(DeviceExtension, cdb);
+    blocks = (Srb->DataTransferLength + adaptExt->info.blk_size - 1) / adaptExt->info.blk_size;
+    if (lba > adaptExt->lastLBA) {
+        RhelDbgPrint(TRACE_LEVEL_ERROR, ("SRB_STATUS_BAD_SRB_BLOCK_LENGTH lba = %llu lastLBA= %llu\n", lba, adaptExt->lastLBA));
+        Srb->SrbStatus = SRB_STATUS_BAD_SRB_BLOCK_LENGTH;
+        CompleteSRB(DeviceExtension, Srb);
+        return FALSE;
+    }
+    if ((lba + blocks) > adaptExt->lastLBA) {
+        blocks = (ULONG)(adaptExt->lastLBA + 1 - lba);
+        RhelDbgPrint(TRACE_LEVEL_ERROR, ("lba = %llu lastLBA= %llu blocks = %lu\n", lba, adaptExt->lastLBA, blocks));
+        Srb->DataTransferLength = (ULONG)(blocks * adaptExt->info.blk_size);
+    }
+
     sgList = StorPortGetScatterGatherList(DeviceExtension, Srb);
     sgMaxElements = min((MAX_PHYS_SEGMENTS + 1), sgList->NumberOfElements);
     srbExt->Xfer = 0;
@@ -918,7 +956,7 @@ VirtIoBuildIo(
         srbExt->Xfer += sgList->List[i].Length;
     }
 
-    srbExt->vbr.out_hdr.sector = RhelGetLba(DeviceExtension, cdb);
+    srbExt->vbr.out_hdr.sector = lba;
     srbExt->vbr.out_hdr.ioprio = 0;
     srbExt->vbr.req            = (PVOID)Srb;
     srbExt->fua                = (cdb->CDB10.ForceUnitAccess == 1);
@@ -983,13 +1021,10 @@ VirtIoMSInterruptRoutine (
            }
         }
         if (vbr->out_hdr.type == VIRTIO_BLK_T_FLUSH) {
-            --adaptExt->in_fly;
             CompleteSRB(DeviceExtension, Srb);
         } else if (vbr->out_hdr.type == VIRTIO_BLK_T_GET_ID) {
             adaptExt->sn_ok = TRUE;
         } else if (Srb) {
-            --adaptExt->in_fly;
-
             srbExt   = (PRHEL_SRB_EXTENSION)Srb->SrbExtension;
             if (srbExt->fua == TRUE) {
                RemoveEntryList(&vbr->list_entry);
@@ -1006,9 +1041,6 @@ VirtIoMSInterruptRoutine (
             }
         }
         isInterruptServiced = TRUE;
-    }
-    if (adaptExt->in_fly > 0) {
-        virtqueue_kick(adaptExt->vq);
     }
     return isInterruptServiced;
 }
@@ -1266,6 +1298,7 @@ RhelScsiGetCapacity(
 
     blocksize = adaptExt->info.blk_size;
     lastLBA = adaptExt->info.capacity / (blocksize / SECTOR_SIZE) - 1;
+    adaptExt->lastLBA = lastLBA;
 
     if (Srb->DataTransferLength == sizeof(READ_CAPACITY_DATA)) {
         if (lastLBA > 0xFFFFFFFF) {

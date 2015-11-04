@@ -1,5 +1,5 @@
 /**********************************************************************
- * Copyright (c) 2008  Red Hat, Inc.
+ * Copyright (c) 2008-2015 Red Hat, Inc.
  *
  * File: ParaNdis6-Oid.c
  *
@@ -13,6 +13,8 @@
 
 #include "ParaNdis-Oid.h"
 #include "ParaNdis6.h"
+#include "kdebugprint.h"
+#include "ParaNdis_DebugHistory.h"
 
 static NDIS_IO_WORKITEM_FUNCTION OnSetPowerWorkItem;
 
@@ -475,6 +477,7 @@ NDIS_STATUS ParaNdis6_OidRequest(
                 status = NDIS_STATUS_NOT_SUPPORTED;
                 break;
             }
+            __fallthrough;
         case NdisRequestQueryInformation:
             if (Rules.Flags & ohfQuery)
             {
@@ -898,6 +901,7 @@ static ULONG SetOffloadField(
             }
             break;
         case NDIS_OFFLOAD_PARAMETERS_NO_CHANGE:
+            __fallthrough;
         default:
             break;
         }
@@ -978,6 +982,7 @@ static NDIS_STATUS ApplyOffloadConfiguration(PARANDIS_ADAPTER *pContext,
     }
     else if (NDIS_OFFLOAD_PARAMETERS_LSOV1_ENABLED == pop->LsoV1 || NDIS_OFFLOAD_PARAMETERS_LSOV2_ENABLED  == pop->LsoV2IPv4)
     {
+        #pragma warning(suppress: 4463)
         if (fSupported.fTxLso) pf->fTxLso = 1;
         else
             bFailed = TRUE;
@@ -989,6 +994,7 @@ static NDIS_STATUS ApplyOffloadConfiguration(PARANDIS_ADAPTER *pContext,
     }
     else if (NDIS_OFFLOAD_PARAMETERS_LSOV2_ENABLED  == pop->LsoV2IPv6)
     {
+        #pragma warning(suppress: 4463)
         if (fSupported.fTxLsov6) pf->fTxLsov6 = 1;
         else
             bFailed = TRUE;

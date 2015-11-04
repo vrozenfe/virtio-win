@@ -1,5 +1,5 @@
 /**********************************************************************
- * Copyright (c) 2012  Red Hat, Inc.
+ * Copyright (c) 2012-2015 Red Hat, Inc.
  *
  * File: vioscsi.c
  *
@@ -15,6 +15,11 @@
 #include "vioscsi.h"
 #include "utils.h"
 #include "helper.h"
+#include "vioscsidt.h"
+
+#define VioScsiWmi_MofResourceName        L"MofResource"
+
+#define VIOSCSI_SETUP_GUID_INDEX 0
 
 BOOLEAN IsCrashDumpMode;
 
@@ -136,6 +141,55 @@ VioScsiMSInterrupt(
     );
 #endif
 
+VOID
+VioScsiWmiInitialize(
+    IN PVOID  DeviceExtension
+    );
+
+VOID
+VioScsiWmiSrb(
+    IN PVOID  DeviceExtension,
+    IN OUT PSCSI_WMI_REQUEST_BLOCK Srb
+    );
+
+BOOLEAN
+VioScsiQueryWmiDataBlock(
+    IN PVOID Context,
+    IN PSCSIWMI_REQUEST_CONTEXT RequestContext,
+    IN ULONG GuidIndex,
+    IN ULONG InstanceIndex,
+    IN ULONG InstanceCount,
+    IN OUT PULONG InstanceLengthArray,
+    IN ULONG OutBufferSize,
+    OUT PUCHAR Buffer
+    );
+
+UCHAR
+VioScsiQueryWmiRegInfo(
+    IN PVOID Context,
+    IN PSCSIWMI_REQUEST_CONTEXT RequestContext,
+    OUT PWCHAR *MofResourceName
+    );
+
+VOID
+VioScsiReadExtendedData(
+    IN PVOID Context,
+    OUT PUCHAR Buffer
+   );
+
+GUID VioScsiWmiExtendedInfoGuid = VioScsiWmi_ExtendedInfo_Guid;
+
+SCSIWMIGUIDREGINFO VioScsiGuidList[] =
+{
+   {&VioScsiWmiExtendedInfoGuid,
+    1,
+    0
+   },
+};
+
+#define VioScsiGuidCount (sizeof(VioScsiGuidList) / sizeof(SCSIWMIGUIDREGINFO))
+
+
 ULONG
 DriverEntry(
     IN PVOID  DriverObject,
@@ -151,12 +205,13 @@ DriverEntry(
     RhelDbgPrint(TRACE_LEVEL_FATAL, ("Vioscsi driver started...built on %s %s\n", __DATE__, __TIME__));
     IsCrashDumpMode = FALSE;
     if (RegistryPath == NULL) {
-        RhelDbgPrint(TRACE_LEVEL_INFORMATION,
-                     ("DriverEntry: Crash dump mode\n"));
         IsCrashDumpMode = TRUE;
+//        virtioDebugLevel = 0xff;
+//        nViostorDebugLevel = TRACE_LEVEL_VERBOSE;
+        RhelDbgPrint(TRACE_LEVEL_INFORMATION, ("DriverEntry: Crash dump mode\n"));
     }
 
-    memset(&hwInitData, 0, sizeof(HW_INITIALIZATION_DATA));
+    RtlZeroMemory(&hwInitData, sizeof(HW_INITIALIZATION_DATA));
 
     hwInitData.HwInitializationDataSize = sizeof(HW_INITIALIZATION_DATA);
 
@@ -207,6 +262,7 @@ VioScsiFindAdapter(
     ULONG              Size;
     ULONG              index;
     ULONG              num_cpus;
+    ULONG              max_cpus;
 #if (MSI_SUPPORTED == 1)
     PPCI_COMMON_CONFIG pPciConf = NULL;
     UCHAR              pci_cfg_buf[256];
@@ -221,7 +277,7 @@ VioScsiFindAdapter(
 ENTER_FN();
 
     adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
-    memset(adaptExt, 0, sizeof(ADAPTER_EXTENSION));
+    RtlZeroMemory(adaptExt, sizeof(ADAPTER_EXTENSION));
 
     adaptExt->dump_mode  = IsCrashDumpMode;
 
@@ -230,7 +286,7 @@ ENTER_FN();
     ConfigInfo->DmaWidth                    = Width32Bits;
     ConfigInfo->Dma32BitAddresses           = TRUE;
     ConfigInfo->Dma64BitAddresses           = TRUE;
-    ConfigInfo->WmiDataProvider             = FALSE;
+    ConfigInfo->WmiDataProvider             = TRUE;
     ConfigInfo->AlignmentMask               = 0x3;
     ConfigInfo->MapBuffers                  = STOR_MAP_NON_READ_WRITE_BUFFERS;
     ConfigInfo->SynchronizationModel        = StorSynchronizeFullDuplex;
@@ -238,6 +294,9 @@ ENTER_FN();
     ConfigInfo->HwMSInterruptRoutine        = VioScsiMSInterrupt;
     ConfigInfo->InterruptSynchronizationMode=InterruptSynchronizePerMessage;
 #endif
+
+    VioScsiWmiInitialize(DeviceExtension);
+
     if (!InitHW(DeviceExtension, ConfigInfo)) {
         RhelDbgPrint(TRACE_LEVEL_FATAL, ("Cannot initialize HardWare\n"));
         return SP_RETURN_NOT_FOUND;
@@ -254,17 +313,18 @@ ENTER_FN();
     {
         UCHAR CapOffset;
         PPCI_MSIX_CAPABILITY pMsixCapOffset;
-
+        PPCI_COMMON_HEADER   pPciComHeader;
         pPciConf = (PPCI_COMMON_CONFIG)pci_cfg_buf;
-        if ( (pPciConf->Status & PCI_STATUS_CAPABILITIES_LIST) == 0)
+        pPciComHeader = (PPCI_COMMON_HEADER)pci_cfg_buf;
+        if ( (pPciComHeader->Status & PCI_STATUS_CAPABILITIES_LIST) == 0)
         {
            RhelDbgPrint(TRACE_LEVEL_INFORMATION, ("NO CAPABILITIES_LIST\n"));
         }
         else
         {
-           if ( (pPciConf->HeaderType & (~PCI_MULTIFUNCTION)) == PCI_DEVICE_TYPE )
+           if ( (pPciComHeader->HeaderType & (~PCI_MULTIFUNCTION)) == PCI_DEVICE_TYPE )
            {
-              CapOffset = pPciConf->u.type0.CapabilitiesPtr;
+              CapOffset = pPciComHeader->u.type0.CapabilitiesPtr;
               while (CapOffset != 0)
               {
                  pMsixCapOffset = (PPCI_MSIX_CAPABILITY)(pci_cfg_buf + CapOffset);
@@ -301,9 +361,9 @@ ENTER_FN();
 
     GetScsiConfig(DeviceExtension);
 
-    ConfigInfo->NumberOfBuses               = 1;
-    ConfigInfo->MaximumNumberOfTargets      = (UCHAR)adaptExt->scsi_config.max_target;
-    ConfigInfo->MaximumNumberOfLogicalUnits = (UCHAR)adaptExt->scsi_config.max_lun;
+    ConfigInfo->MaximumNumberOfTargets      = min((UCHAR)adaptExt->scsi_config.max_target, 255/*SCSI_MAXIMUM_TARGETS_PER_BUS*/);
+    ConfigInfo->MaximumNumberOfLogicalUnits = min((UCHAR)adaptExt->scsi_config.max_lun, SCSI_MAXIMUM_LUNS_PER_TARGET);
+    ConfigInfo->MaxNumberOfIO = 1000;
     if(adaptExt->dump_mode) {
         ConfigInfo->NumberOfPhysicalBreaks  = 8;
     } else {
@@ -315,11 +375,13 @@ ENTER_FN();
 
 #if (NTDDI_VERSION >= NTDDI_WIN7)
     num_cpus = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+    max_cpus = KeQueryMaximumProcessorCountEx(ALL_PROCESSOR_GROUPS);
 #else
     num_cpus = KeQueryActiveProcessorCount(NULL);
+    max_cpus = KeQueryMaximumProcessorCount();
 #endif
     adaptExt->num_queues = adaptExt->scsi_config.num_queues;
-    memset(adaptExt->cpu_to_vq_map, (UCHAR)VIRTIO_SCSI_REQUEST_QUEUE_0, MAX_CPU);
+    RtlFillMemory(adaptExt->cpu_to_vq_map, (UCHAR)VIRTIO_SCSI_REQUEST_QUEUE_0, MAX_CPU);
     if (adaptExt->dump_mode || !adaptExt->msix_enabled)
     {
         adaptExt->num_queues = 1;
@@ -336,6 +398,7 @@ ENTER_FN();
     }
 
     RhelDbgPrint(TRACE_LEVEL_INFORMATION, ("Queues %d CPUs %d\n", adaptExt->num_queues, num_cpus));
+    ConfigInfo->NumberOfBuses               = (UCHAR)adaptExt->num_queues;
 
     if (adaptExt->dump_mode) {
         for (index = VIRTIO_SCSI_CONTROL_QUEUE; index < adaptExt->num_queues + VIRTIO_SCSI_REQUEST_QUEUE_0; ++index) {
@@ -345,8 +408,7 @@ ENTER_FN();
     }
 
     adaptExt->features = StorPortReadPortUlong(DeviceExtension, (PULONG)(adaptExt->device_base + VIRTIO_PCI_HOST_FEATURES));
-
-    adaptExt->allocationSize = PAGE_SIZE;
+    adaptExt->allocationSize = 0;
     adaptExt->offset = 0;
     Size = 0;
     for (index = VIRTIO_SCSI_CONTROL_QUEUE; index <= VIRTIO_SCSI_REQUEST_QUEUE_0; ++index) {
@@ -361,14 +423,19 @@ ENTER_FN();
         }
         adaptExt->allocationSize += ROUND_TO_PAGES(Size);
     }
-    adaptExt->allocationSize += (ROUND_TO_PAGES(Size) * (adaptExt->num_queues - 1));
+    if(!adaptExt->dump_mode) {
+        adaptExt->allocationSize += (ROUND_TO_PAGES(Size) * max_cpus);
+        adaptExt->allocationSize += ROUND_TO_PAGES(sizeof(SRB_EXTENSION));
+        adaptExt->allocationSize += ROUND_TO_PAGES(sizeof(VirtIOSCSIEventNode) * 8);
+        adaptExt->allocationSize += ROUND_TO_PAGES(sizeof(STOR_DPC) * adaptExt->num_queues);
+    } else {
+        adaptExt->allocationSize += ROUND_TO_PAGES(Size);
+    }
     if (adaptExt->num_queues + VIRTIO_SCSI_REQUEST_QUEUE_0 > MAX_QUEUES_PER_DEVICE_DEFAULT)
     {
         adaptExt->allocationSize += ROUND_TO_PAGES(VirtIODeviceSizeRequired((USHORT)(adaptExt->num_queues + VIRTIO_SCSI_REQUEST_QUEUE_0)));
     }
-    adaptExt->allocationSize += ROUND_TO_PAGES(sizeof(SRB_EXTENSION));
-    adaptExt->allocationSize += ROUND_TO_PAGES(sizeof(VirtIOSCSIEventNode) * 8);
-    adaptExt->allocationSize += ROUND_TO_PAGES(sizeof(STOR_DPC) * adaptExt->num_queues);
+    adaptExt->allocationSize += PAGE_SIZE;
 
 #if (INDIRECT_SUPPORTED == 1)
     if(!adaptExt->dump_mode) {
@@ -391,6 +458,7 @@ ENTER_FN();
                 adaptExt->queue_depth));
 
     adaptExt->uncachedExtensionVa = StorPortGetUncachedExtension(DeviceExtension, ConfigInfo, adaptExt->allocationSize);
+    RhelDbgPrint(TRACE_LEVEL_INFORMATION, ("StorPortGetUncachedExtension uncachedExtensionVa = %p allocation size = %d\n", adaptExt->uncachedExtensionVa, adaptExt->allocationSize));
     if (!adaptExt->uncachedExtensionVa) {
         LogError(DeviceExtension,
                 SP_INTERNAL_ADAPTER_ERROR,
@@ -399,7 +467,19 @@ ENTER_FN();
         RhelDbgPrint(TRACE_LEVEL_FATAL, ("Can't get uncached extension allocation size = %d\n", adaptExt->allocationSize));
         return SP_RETURN_ERROR;
     }
+    adaptExt->uncachedExtensionVa = (PVOID)(((ULONG_PTR)(adaptExt->uncachedExtensionVa) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
+    RhelDbgPrint(TRACE_LEVEL_INFORMATION, ("StorPortGetUncachedExtension uncachedExtensionVa = %p allocation size = %d\n", adaptExt->uncachedExtensionVa, adaptExt->allocationSize));
+    RhelDbgPrint(TRACE_LEVEL_INFORMATION, ("pmsg_affinity = %p\n",adaptExt->pmsg_affinity));
+    if (!adaptExt->dump_mode && (adaptExt->num_queues > 1) && (adaptExt->pmsg_affinity == NULL)) {
+        ULONG Status =
+        StorPortAllocatePool(DeviceExtension,
+                             sizeof(GROUP_AFFINITY) * (adaptExt->num_queues + 1),
+                             VIOSCSI_POOL_TAG,
+                             (PVOID*)&adaptExt->pmsg_affinity);
+        RhelDbgPrint(TRACE_LEVEL_FATAL, ("pmsg_affinity = %p Status = %lu\n",adaptExt->pmsg_affinity, Status));
+    }
 
+EXIT_FN();
     return SP_RETURN_FOUND;
 }
 
@@ -416,33 +496,32 @@ ENTER_FN();
         StorPortInitializeDpc(DeviceExtension,
             &adaptExt->dpc[index],
             VioScsiCompleteDpcRoutine);
-        InitializeListHead(&adaptExt->srb_list[index]);
     }
     adaptExt->dpc_ok = TRUE;
 EXIT_FN();
     return TRUE;
 }
 
-
 static struct virtqueue *FindVirtualQueue(PADAPTER_EXTENSION adaptExt, ULONG index, ULONG vector)
 {
     struct virtqueue *vq = NULL;
     if (adaptExt->uncachedExtensionVa)
     {
-        ULONG len;
+        ULONG len = 0;
         PVOID  ptr = (PVOID)((ULONG_PTR)adaptExt->uncachedExtensionVa + adaptExt->offset);
         PHYSICAL_ADDRESS pa = StorPortGetPhysicalAddress(adaptExt, NULL, ptr, &len);
         BOOLEAN useEventIndex = CHECKBIT(adaptExt->features, VIRTIO_RING_F_EVENT_IDX);
         if (pa.QuadPart)
         {
-           ULONG Size;
-           ULONG dummy;
+           ULONG Size = 0;
+           ULONG dummy = 0;
            VirtIODeviceQueryQueueAllocation(adaptExt->pvdev, index, &dummy, &Size);
            ASSERT((adaptExt->offset + Size) < adaptExt->allocationSize);
-           vq = VirtIODevicePrepareQueue(adaptExt->pvdev, index, pa, ptr, len, NULL, useEventIndex);
+           vq = VirtIODevicePrepareQueue(adaptExt->pvdev, index, pa, ptr, Size, NULL, useEventIndex);
            if (vq == NULL)
            {
-               RhelDbgPrint(TRACE_LEVEL_FATAL, ("%s>> cannot create virtual queue index = %d vector = % pa = %08I64X\n", __FUNCTION__, index, vector, pa.QuadPart));
+               RhelDbgPrint(TRACE_LEVEL_FATAL, ("%s>> cannot create virtual queue index = %d vector = %d ptr= %p pa = %08I64X Size = %x uncachedExtensionVa = %p offset = %x\n",
+                    __FUNCTION__, index, vector, ptr, pa.QuadPart, Size, adaptExt->uncachedExtensionVa, adaptExt->offset));
                return NULL;
            }
            adaptExt->offset += ROUND_TO_PAGES(Size);
@@ -456,10 +535,10 @@ static struct virtqueue *FindVirtualQueue(PADAPTER_EXTENSION adaptExt, ULONG ind
         }
         if (vector)
         {
-           unsigned res;
+           unsigned res = VIRTIO_MSI_NO_VECTOR;
            StorPortWritePortUshort(adaptExt, (PUSHORT)(adaptExt->pvdev->addr + VIRTIO_MSI_QUEUE_VECTOR),(USHORT)vector);
            res = StorPortReadPortUshort(adaptExt, (PUSHORT)(adaptExt->pvdev->addr + VIRTIO_MSI_QUEUE_VECTOR));
-           RhelDbgPrint(TRACE_LEVEL_FATAL, ("%s>> VIRTIO_MSI_QUEUE_VECTOR vector = %d, res = 0x%x\n", __FUNCTION__, vector, res));
+           RhelDbgPrint(TRACE_LEVEL_INFORMATION, ("%s>> VIRTIO_MSI_QUEUE_VECTOR vector = %d, res = 0x%x\n", __FUNCTION__, vector, res));
            if(res == VIRTIO_MSI_NO_VECTOR)
            {
               VirtIODeviceDeleteQueue(vq, NULL);
@@ -480,6 +559,7 @@ static struct virtqueue *FindVirtualQueue(PADAPTER_EXTENSION adaptExt, ULONG ind
     }
     return vq;
 }
+
 
 BOOLEAN
 VioScsiHwInitialize(
@@ -539,7 +619,7 @@ ENTER_FN();
             ULONG_PTR ptr = ((ULONG_PTR)adaptExt->uncachedExtensionVa + adaptExt->offset);
             ULONG size = ROUND_TO_PAGES(VirtIODeviceSizeRequired((USHORT)(adaptExt->num_queues + VIRTIO_SCSI_REQUEST_QUEUE_0)));
             adaptExt->offset += size;
-            memcpy((PVOID)ptr, (PVOID)adaptExt->pvdev, sizeof(VirtIODevice));
+            RtlCopyMemory((PVOID)ptr, (PVOID)adaptExt->pvdev, sizeof(VirtIODevice));
             adaptExt->pvdev = (VirtIODevice*)ptr;
             VirtIODeviceInitialize(adaptExt->pvdev,  adaptExt->device_base, size);
         }
@@ -582,14 +662,14 @@ ENTER_FN();
     }
     if (!adaptExt->dump_mode)
     {
-        if (adaptExt->num_queues > 1) {
-            adaptExt->perfFlags = 0;
+        if ((adaptExt->num_queues > 1) && (adaptExt->perfFlags == 0)) {
+#if 0
             perfData.Version = STOR_PERF_VERSION;
             perfData.Size = sizeof(PERF_CONFIGURATION_DATA);
 
             status = StorPortInitializePerfOpts(DeviceExtension, TRUE, &perfData);
 
-            RhelDbgPrint(TRACE_LEVEL_FATAL, ("Perf Version = 0x%x, Flags = 0x%x, ConcurrentChannels = %d, FirstRedirectionMessageNumber = %d,LastRedirectionMessageNumber = %d\n",
+            RhelDbgPrint(TRACE_LEVEL_INFORMATION, ("Perf Version = 0x%x, Flags = 0x%x, ConcurrentChannels = %d, FirstRedirectionMessageNumber = %d,LastRedirectionMessageNumber = %d\n",
                 perfData.Version, perfData.Flags, perfData.ConcurrentChannels, perfData.FirstRedirectionMessageNumber, perfData.LastRedirectionMessageNumber));
             if (status == STOR_STATUS_SUCCESS) {
                 if (CHECKFLAG(perfData.Flags, STOR_PERF_DPC_REDIRECTION)) {
@@ -597,34 +677,43 @@ ENTER_FN();
                 }
                 if (CHECKFLAG(perfData.Flags, STOR_PERF_CONCURRENT_CHANNELS)) {
                     adaptExt->perfFlags |= STOR_PERF_CONCURRENT_CHANNELS;
-                    perfData.ConcurrentChannels = adaptExt->num_queues;
+                    perfData.ConcurrentChannels = adaptExt->num_queues + 1;
                 }
-                if (CHECKFLAG(perfData.Flags, STOR_PERF_INTERRUPT_MESSAGE_RANGES)) {
-                    adaptExt->perfFlags |= STOR_PERF_INTERRUPT_MESSAGE_RANGES;
-                    perfData.FirstRedirectionMessageNumber = 2;
-                    perfData.LastRedirectionMessageNumber = 256;
-                }
+#if 0
                 if (CHECKFLAG(perfData.Flags, STOR_PERF_OPTIMIZE_FOR_COMPLETION_DURING_STARTIO)) {
                     adaptExt->perfFlags |= STOR_PERF_OPTIMIZE_FOR_COMPLETION_DURING_STARTIO;
                 }
+#endif
+#if 1
+                if (adaptExt->pmsg_affinity != NULL) {
+                    RtlZeroMemory((PCHAR)adaptExt->pmsg_affinity, sizeof (GROUP_AFFINITY)* (adaptExt->num_queues + 1));
+                    if (CHECKFLAG(perfData.Flags, STOR_PERF_INTERRUPT_MESSAGE_RANGES)) {
+                        adaptExt->perfFlags |= (STOR_PERF_INTERRUPT_MESSAGE_RANGES | STOR_PERF_ADV_CONFIG_LOCALITY);
+                        perfData.FirstRedirectionMessageNumber = 3;
+                        perfData.LastRedirectionMessageNumber = 3 + adaptExt->num_queues -1;
+                    }
+                    perfData.MessageTargets = adaptExt->pmsg_affinity;
+                }
+#endif
                 perfData.Flags = adaptExt->perfFlags;
                 RhelDbgPrint(TRACE_LEVEL_FATAL, ("Perf Version = 0x%x, Flags = 0x%x, ConcurrentChannels = %d, FirstRedirectionMessageNumber = %d,LastRedirectionMessageNumber = %d\n",
                     perfData.Version, perfData.Flags, perfData.ConcurrentChannels, perfData.FirstRedirectionMessageNumber, perfData.LastRedirectionMessageNumber));
                 status = StorPortInitializePerfOpts(DeviceExtension, FALSE, &perfData);
                 if (status != STOR_STATUS_SUCCESS) {
-                    perfData.Flags = 0;
-                    RhelDbgPrint(TRACE_LEVEL_FATAL, ("%s StorPortInitializePerfOpts FALSE status = 0x%x\n", __FUNCTION__, status));
+                    adaptExt->perfFlags = 0;
+                    RhelDbgPrint(TRACE_LEVEL_ERROR, ("%s StorPortInitializePerfOpts FALSE status = 0x%x\n", __FUNCTION__, status));
                 }
                 else {
-                    RhelDbgPrint(TRACE_LEVEL_FATAL, ("Perf Version = 0x%x, Flags = 0x%x, ConcurrentChannels = %d, FirstRedirectionMessageNumber = %d,LastRedirectionMessageNumber = %d\n",
+                    RhelDbgPrint(TRACE_LEVEL_INFORMATION, ("Perf Version = 0x%x, Flags = 0x%x, ConcurrentChannels = %d, FirstRedirectionMessageNumber = %d,LastRedirectionMessageNumber = %d\n",
                         perfData.Version, perfData.Flags, perfData.ConcurrentChannels, perfData.FirstRedirectionMessageNumber, perfData.LastRedirectionMessageNumber));
                 }
             }
             else {
-                RhelDbgPrint(TRACE_LEVEL_FATAL, ("%s StorPortInitializePerfOpts TRUE status = 0x%x\n", __FUNCTION__, status));
+                RhelDbgPrint(TRACE_LEVEL_INFORMATION, ("%s StorPortInitializePerfOpts TRUE status = 0x%x\n", __FUNCTION__, status));
             }
+#endif
         }
-        if (!adaptExt->dpc_ok && !StorPortEnablePassiveInitialization(DeviceExtension, VioScsiPassiveInitializeRoutine)) {
+        if ((adaptExt->num_queues > 1) && !adaptExt->dpc_ok && !StorPortEnablePassiveInitialization(DeviceExtension, VioScsiPassiveInitializeRoutine)) {
             return FALSE;
         }
     }
@@ -649,7 +738,7 @@ ENTER_FN();
     }
     else
     {
-        SendSRB(DeviceExtension, Srb);
+        return SendSRB(DeviceExtension, Srb);
     }
 EXIT_FN();
     return TRUE;
@@ -732,7 +821,7 @@ VioScsiInterrupt(
            {
               PSENSE_DATA pSense = (PSENSE_DATA) Srb->SenseInfoBuffer;
               if (Srb->SenseInfoBufferLength >= FIELD_OFFSET(SENSE_DATA, CommandSpecificInformation)) {
-                 memcpy(Srb->SenseInfoBuffer, resp->sense,
+                 RtlCopyMemory(Srb->SenseInfoBuffer, resp->sense,
                  min(resp->sense_len, Srb->SenseInfoBufferLength));
                  if (Srb->SrbStatus == SRB_STATUS_ERROR) {
                      Srb->SrbStatus |= SRB_STATUS_AUTOSENSE_VALID;
@@ -966,7 +1055,7 @@ ENTER_FN();
     srbExt   = (PSRB_EXTENSION)Srb->SrbExtension;
     adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
 
-    if( (Srb->PathId > 0) ||
+    if( (Srb->PathId > (UCHAR)adaptExt->num_queues) ||
         (Srb->TargetId >= adaptExt->scsi_config.max_target) ||
         (Srb->Lun >= adaptExt->scsi_config.max_lun) ) {
         Srb->SrbStatus = SRB_STATUS_NO_DEVICE;
@@ -978,20 +1067,19 @@ ENTER_FN();
 
     RhelDbgPrint(TRACE_LEVEL_VERBOSE, ("<-->%s (%d::%d::%d)\n", DbgGetScsiOpStr(Srb), Srb->PathId, Srb->TargetId, Srb->Lun));
 
-    memset(srbExt, 0, sizeof(*srbExt));
+    RtlZeroMemory(srbExt, sizeof(*srbExt));
     srbExt->Srb = Srb;
-    StorPortGetCurrentProcessorNumber(DeviceExtension, &srbExt->procNum);
     cmd = &srbExt->cmd;
     cmd->sc = Srb;
     cmd->req.cmd.lun[0] = 1;
     cmd->req.cmd.lun[1] = Srb->TargetId;
     cmd->req.cmd.lun[2] = 0;
     cmd->req.cmd.lun[3] = Srb->Lun;
-    cmd->req.cmd.tag = (unsigned long)Srb;
+    cmd->req.cmd.tag = (ULONG_PTR)(Srb);
     cmd->req.cmd.task_attr = VIRTIO_SCSI_S_SIMPLE;
     cmd->req.cmd.prio = 0;
     cmd->req.cmd.crn = 0;
-    memcpy(cmd->req.cmd.cdb, cdb, min(VIRTIO_SCSI_CDB_SIZE, Srb->CdbLength));
+    RtlCopyMemory(cmd->req.cmd.cdb, cdb, min(VIRTIO_SCSI_CDB_SIZE, Srb->CdbLength));
 
     sgElement = 0;
     srbExt->sg[sgElement].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &cmd->req.cmd, &fragLen);
@@ -1042,29 +1130,23 @@ DispatchQueue(
 )
 {
     PADAPTER_EXTENSION  adaptExt;
-#if (NTDDI_VERSION >= NTDDI_WIN7)
-    PROCESSOR_NUMBER ProcNumber;
-    ULONG processor = KeGetCurrentProcessorNumberEx(&ProcNumber);
-    ULONG cpu = ProcNumber.Number;
-#else
-    ULONG cpu = KeGetCurrentProcessorNumber();
-#endif
+ENTER_FN();
 
     adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
-    if (!adaptExt->dump_mode && adaptExt->dpc_ok && MessageID > 0) {
+
+    if ((adaptExt->num_queues > 1) && adaptExt->dpc_ok && MessageID > 0) {
         StorPortIssueDpc(DeviceExtension,
-            &adaptExt->dpc[cpu],
+            &adaptExt->dpc[MessageID-3],
             ULongToPtr(MessageID),
-            ULongToPtr(cpu));
+            ULongToPtr(MessageID));
+EXIT_FN();
         return;
     }
     ProcessQueue(DeviceExtension, MessageID, FALSE);
 EXIT_FN();
-
 }
 
 VOID
-FORCEINLINE
 ProcessQueue(
     IN PVOID DeviceExtension,
     IN ULONG MessageID,
@@ -1077,14 +1159,12 @@ ProcessQueue(
     PSCSI_REQUEST_BLOCK Srb;
     PSRB_EXTENSION      srbExt;
     ULONG               msg = MessageID - 3;
+    STOR_LOCK_HANDLE    LockHandle = { 0 };
 
-#if (NTDDI_VERSION >= NTDDI_WIN7)
-        PROCESSOR_NUMBER ProcNumber;
-        ULONG processor = KeGetCurrentProcessorNumberEx(&ProcNumber);
-#else
-        ULONG processor = KeGetCurrentProcessorNumber();
-#endif
     adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+ENTER_FN();
+
+    VioScsiAcquireSpinLock(DeviceExtension, MessageID, &LockHandle);
 
     while ((cmd = (PVirtIOSCSICmd)virtqueue_get_buf(adaptExt->vq[VIRTIO_SCSI_REQUEST_QUEUE_0 + msg], &len)) != NULL)
     {
@@ -1093,31 +1173,7 @@ ProcessQueue(
         resp = &cmd->resp.cmd;
         srbExt = (PSRB_EXTENSION)Srb->SrbExtension;
 
-#if (NTDDI_VERSION >= NTDDI_WIN7)
-        CHECK_CPU(Srb);
-#endif
-        if ((adaptExt->num_queues > 1) &&
-#if (NTDDI_VERSION >= NTDDI_WIN7)
-            (ProcNumber.Group != srbExt->procNum.Group ||
-            ProcNumber.Number != srbExt->procNum.Number)
-#else
-            processor != srbExt->procNum.Number
-#endif
-            )
-        {
-            ULONG tmp;
-            RhelDbgPrint(TRACE_LEVEL_INFORMATION, ("Srb %p issued on %d::%d received on %d::%d MessgeId %d Queue %d\n",
-                Srb, srbExt->procNum.Group, srbExt->procNum.Number, ProcNumber.Group, ProcNumber.Number, MessageID, VIRTIO_SCSI_REQUEST_QUEUE_0 + msg));
-
-#if (NTDDI_VERSION >= NTDDI_WIN7)
-            tmp = adaptExt->cpu_to_vq_map[ProcNumber.Number];
-            adaptExt->cpu_to_vq_map[ProcNumber.Number] = adaptExt->cpu_to_vq_map[srbExt->procNum.Number];
-#else
-            tmp = adaptExt->cpu_to_vq_map[processor];
-            adaptExt->cpu_to_vq_map[processor] = adaptExt->cpu_to_vq_map[srbExt->procNum.Number];
-#endif
-            adaptExt->cpu_to_vq_map[srbExt->procNum.Number] = (UCHAR)tmp;
-        }
+        VioScsiReleaseSpinLock(DeviceExtension, MessageID, &LockHandle);
 
         switch (resp->response)
         {
@@ -1170,7 +1226,7 @@ ProcessQueue(
         {
             PSENSE_DATA pSense = (PSENSE_DATA)Srb->SenseInfoBuffer;
             if (Srb->SenseInfoBufferLength >= FIELD_OFFSET(SENSE_DATA, CommandSpecificInformation)) {
-                memcpy(Srb->SenseInfoBuffer, resp->sense,
+                RtlCopyMemory(Srb->SenseInfoBuffer, resp->sense,
                     min(resp->sense_len, Srb->SenseInfoBufferLength));
                 if (Srb->SrbStatus == SRB_STATUS_ERROR) {
                     Srb->SrbStatus |= SRB_STATUS_AUTOSENSE_VALID;
@@ -1188,7 +1244,12 @@ ProcessQueue(
             Srb->SrbStatus = SRB_STATUS_DATA_OVERRUN;
         }
         CompleteRequest(DeviceExtension, Srb);
+        VioScsiAcquireSpinLock(DeviceExtension, MessageID, &LockHandle);
     }
+
+    VioScsiReleaseSpinLock(DeviceExtension, MessageID, &LockHandle);
+
+EXIT_FN();
 }
 
 VOID
@@ -1206,7 +1267,6 @@ ENTER_FN();
     srbExt   = (PSRB_EXTENSION)Srb->SrbExtension;
 
     if (!adaptExt->dump_mode && adaptExt->dpc_ok && MessageID > 0) {
-        InsertTailList(&adaptExt->srb_list[index], &srbExt->list_entry);
         StorPortIssueDpc(DeviceExtension,
             &adaptExt->dpc[index],
             ULongToPtr(MessageID),
@@ -1217,7 +1277,6 @@ ENTER_FN();
 EXIT_FN();
 }
 
-#if 1
 VOID
 VioScsiCompleteDpcRoutine(
     IN PSTOR_DPC  Dpc,
@@ -1233,77 +1292,6 @@ ENTER_FN();
     ProcessQueue(Context, MessageId, TRUE);
 EXIT_FN();
 }
-#else
-VOID
-VioScsiCompleteDpcRoutine(
-    IN PSTOR_DPC  Dpc,
-    IN PVOID Context,
-    IN PVOID SystemArgument1,
-    IN PVOID SystemArgument2
-    )
-{
-    PADAPTER_EXTENSION adaptExt;
-    ULONG MessageId;
-    ULONG index;
-    ULONG OldIrql;
-    STOR_LOCK_HANDLE    LockHandle = { 0 };
-    ULONG status = STOR_STATUS_SUCCESS;
-
-ENTER_FN();
-    adaptExt = (PADAPTER_EXTENSION)Context;
-    MessageId = PtrToUlong(SystemArgument1);
-    index = PtrToUlong(SystemArgument2);
-
-    if (adaptExt->num_queues > 1) {
-        status = StorPortAcquireMSISpinLock(Context, MessageId, &OldIrql);
-        if (status != STOR_STATUS_SUCCESS) {
-            RhelDbgPrint(TRACE_LEVEL_ERROR, ("% StorPortAcquireMSISpinLock returned status 0x%x\n", __FUNCTION__, status));
-        }
-    }
-    else {
-        StorPortAcquireSpinLock(Context, InterruptLock, NULL, &LockHandle);
-    }
-    while (!IsListEmpty(&adaptExt->srb_list[index])) {
-        PSCSI_REQUEST_BLOCK Srb;
-        PSRB_EXTENSION srbExt;
-        srbExt = (PSRB_EXTENSION)RemoveHeadList(&adaptExt->srb_list[index]);
-        Srb = (PSCSI_REQUEST_BLOCK)srbExt->Srb;
-#if (NTDDI_VERSION >= NTDDI_WIN7)
-        CHECK_CPU(Srb);
-#endif
-        if (adaptExt->num_queues > 1) {
-            status = StorPortReleaseMSISpinLock(Context, MessageId, OldIrql);
-            if (status != STOR_STATUS_SUCCESS) {
-                RhelDbgPrint(TRACE_LEVEL_ERROR, ("%s StorPortReleaseMSISpinLock returned status 0x%x\n", __FUNCTION__, status));
-            }
-
-        }
-        else {
-            StorPortReleaseSpinLock(Context, &LockHandle);
-        }
-        CompleteRequest(Context, Srb);
-        if (adaptExt->num_queues > 1) {
-            status = StorPortAcquireMSISpinLock(Context, MessageId, &OldIrql);
-            if (status != STOR_STATUS_SUCCESS) {
-                RhelDbgPrint(TRACE_LEVEL_ERROR, ("%s StorPortAcquireMSISpinLock returned status 0x%x\n", __FUNCTION__, status));
-            }
-        }
-        else {
-            StorPortAcquireSpinLock(Context, InterruptLock, NULL, &LockHandle);
-        }
-    }
-    if (adaptExt->num_queues > 1) {
-        status = StorPortReleaseMSISpinLock(Context, MessageId, OldIrql);
-        if (status != STOR_STATUS_SUCCESS) {
-            RhelDbgPrint(TRACE_LEVEL_ERROR, ("%s StorPortReleaseMSISpinLock returned status 0x%x\n", __FUNCTION__, status));
-        }
-    }
-    else {
-        StorPortReleaseSpinLock(Context, &LockHandle);
-    }
-EXIT_FN();
-}
-#endif
 
 BOOLEAN
 FORCEINLINE
@@ -1320,11 +1308,15 @@ ENTER_FN();
     switch (Srb->Function) {
         case SRB_FUNCTION_PNP:
         case SRB_FUNCTION_POWER:
+        case SRB_FUNCTION_RESET_BUS:
         case SRB_FUNCTION_RESET_DEVICE:
         case SRB_FUNCTION_RESET_LOGICAL_UNIT: {
             Srb->SrbStatus = SRB_STATUS_SUCCESS;
             return TRUE;
         }
+        case SRB_FUNCTION_WMI:
+            VioScsiWmiSrb(DeviceExtension, (PSCSI_WMI_REQUEST_BLOCK)Srb);
+            return TRUE;
     }
 EXIT_FN();
     return FALSE;
@@ -1387,7 +1379,8 @@ LogError(
 {
 #if (NTDDI_VERSION > NTDDI_WIN7)
     STOR_LOG_EVENT_DETAILS logEvent;
-    memset( &logEvent, 0, sizeof(logEvent) );
+    ULONG sz = 0;
+    RtlZeroMemory( &logEvent, sizeof(logEvent) );
     logEvent.InterfaceRevision         = STOR_CURRENT_LOG_INTERFACE_REVISION;
     logEvent.Size                      = sizeof(logEvent);
     logEvent.EventAssociation          = StorEventAdapterAssociation;
@@ -1395,7 +1388,7 @@ LogError(
     logEvent.ErrorCode                 = ErrorCode;
     logEvent.DumpDataSize              = sizeof(UniqueId);
     logEvent.DumpData                  = &UniqueId;
-    StorPortLogSystemEvent( DeviceExtension, &logEvent, NULL );
+    StorPortLogSystemEvent( DeviceExtension, &logEvent, &sz );
 #else
     StorPortLogError(DeviceExtension,
                          NULL,
@@ -1447,4 +1440,171 @@ ParamChange(
     {
         StorPortNotification( BusChangeDetected, DeviceExtension, 0);
     }
+}
+
+VOID
+VioScsiWmiInitialize(
+    IN PVOID DeviceExtension
+    )
+{
+    PADAPTER_EXTENSION    adaptExt;
+    PSCSI_WMILIB_CONTEXT WmiLibContext;
+ENTER_FN();
+
+    adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+    WmiLibContext = (PSCSI_WMILIB_CONTEXT)(&(adaptExt->WmiLibContext));
+
+    WmiLibContext->GuidList = VioScsiGuidList;
+    WmiLibContext->GuidCount = VioScsiGuidCount;
+    WmiLibContext->QueryWmiRegInfo = VioScsiQueryWmiRegInfo;
+    WmiLibContext->QueryWmiDataBlock = VioScsiQueryWmiDataBlock;
+    WmiLibContext->SetWmiDataItem = NULL;
+    WmiLibContext->SetWmiDataBlock = NULL;
+    WmiLibContext->WmiFunctionControl = NULL;
+    WmiLibContext->ExecuteWmiMethod = NULL;
+EXIT_FN();
+}
+
+
+
+VOID
+VioScsiWmiSrb(
+    IN PVOID DeviceExtension,
+    IN OUT PSCSI_WMI_REQUEST_BLOCK Srb
+    )
+{
+    UCHAR status;
+    SCSIWMI_REQUEST_CONTEXT requestContext = {0};
+    ULONG retSize;
+    PADAPTER_EXTENSION    adaptExt;
+
+ENTER_FN();
+    adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+
+    ASSERT(Srb->Function == SRB_FUNCTION_WMI);
+    ASSERT(Srb->Length == sizeof(SCSI_WMI_REQUEST_BLOCK));
+    ASSERT(Srb->DataTransferLength >= sizeof(ULONG));
+    ASSERT(Srb->DataBuffer);
+
+    if (!(Srb->WMIFlags & SRB_WMI_FLAGS_ADAPTER_REQUEST))
+    {
+        Srb->DataTransferLength = 0;
+        Srb->SrbStatus = SRB_STATUS_SUCCESS;
+    }
+    else
+    {
+        requestContext.UserContext = Srb;
+        (VOID)ScsiPortWmiDispatchFunction(&adaptExt->WmiLibContext,
+                                                Srb->WMISubFunction,
+                                                DeviceExtension,
+                                                &requestContext,
+                                                Srb->DataPath,
+                                                Srb->DataTransferLength,
+                                                Srb->DataBuffer);
+
+        retSize =  ScsiPortWmiGetReturnSize(&requestContext);
+        status =  ScsiPortWmiGetReturnStatus(&requestContext);
+
+        Srb->DataTransferLength = retSize;
+        Srb->SrbStatus = status;
+    }
+
+EXIT_FN();
+}
+
+BOOLEAN
+VioScsiQueryWmiDataBlock(
+    IN PVOID Context,
+    IN PSCSIWMI_REQUEST_CONTEXT RequestContext,
+    IN ULONG GuidIndex,
+    IN ULONG InstanceIndex,
+    IN ULONG InstanceCount,
+    IN OUT PULONG InstanceLengthArray,
+    IN ULONG OutBufferSize,
+    OUT PUCHAR Buffer
+    )
+{
+    ULONG size = 0;
+    UCHAR status;
+    PADAPTER_EXTENSION    adaptExt;
+
+ENTER_FN();
+    adaptExt = (PADAPTER_EXTENSION)Context;
+
+    ASSERT(InstanceIndex == 0);
+
+    switch (GuidIndex)
+    {
+        case VIOSCSI_SETUP_GUID_INDEX:
+        {
+            size = sizeof(VioScsiExtendedInfo) - 1;
+            if (OutBufferSize < size)
+            {
+                status = SRB_STATUS_DATA_OVERRUN;
+                break;
+            }
+
+            VioScsiReadExtendedData(Context,
+                                     Buffer);
+            *InstanceLengthArray = size;
+            status = SRB_STATUS_SUCCESS;
+            break;
+        }
+
+        default:
+        {
+            status = SRB_STATUS_ERROR;
+        }
+    }
+
+    ScsiPortWmiPostProcess(RequestContext,
+                           status,
+                           size);
+
+EXIT_FN();
+    return status;
+}
+
+UCHAR
+VioScsiQueryWmiRegInfo(
+    IN PVOID Context,
+    IN PSCSIWMI_REQUEST_CONTEXT RequestContext,
+    OUT PWCHAR *MofResourceName
+    )
+{
+ENTER_FN();
+    UNREFERENCED_PARAMETER(Context);
+    UNREFERENCED_PARAMETER(RequestContext);
+
+    *MofResourceName = VioScsiWmi_MofResourceName;
+    return SRB_STATUS_SUCCESS;
+}
+
+VOID
+VioScsiReadExtendedData(
+IN PVOID Context,
+OUT PUCHAR Buffer
+)
+{
+    UCHAR numberOfBytes = sizeof(VioScsiExtendedInfo) - 1;
+    PADAPTER_EXTENSION    adaptExt;
+    PVioScsiExtendedInfo  extInfo;
+
+ENTER_FN();
+
+    adaptExt = (PADAPTER_EXTENSION)Context;
+    extInfo = (PVioScsiExtendedInfo)Buffer;
+
+    RtlZeroMemory(Buffer, numberOfBytes);
+
+    extInfo->QueueDepth = (ULONG)adaptExt->queue_depth;
+    extInfo->QueuesCount = (UCHAR)adaptExt->num_queues;
+    extInfo->Indirect = CHECKBIT(adaptExt->features, VIRTIO_RING_F_INDIRECT_DESC);
+    extInfo->EventIndex = CHECKBIT(adaptExt->features, VIRTIO_RING_F_EVENT_IDX);
+    extInfo->DpcRedirection = CHECKFLAG(adaptExt->perfFlags, STOR_PERF_DPC_REDIRECTION);
+    extInfo->ConcurentChannels = CHECKFLAG(adaptExt->perfFlags, STOR_PERF_CONCURRENT_CHANNELS);
+    extInfo->InterruptMsgRanges = CHECKFLAG(adaptExt->perfFlags, STOR_PERF_INTERRUPT_MESSAGE_RANGES);
+    extInfo->CompletionDuringStartIo = CHECKFLAG(adaptExt->perfFlags, STOR_PERF_OPTIMIZE_FOR_COMPLETION_DURING_STARTIO);
+
+EXIT_FN();
 }
