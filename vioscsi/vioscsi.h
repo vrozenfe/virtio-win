@@ -228,7 +228,7 @@ typedef struct _SRB_EXTENSION {
 #if (INDIRECT_SUPPORTED == 1)
     struct vring_desc_alias     desc[VIRTIO_MAX_SG];
 #endif
-//    UCHAR                 PathId;
+    UCHAR                 cpu;
 }SRB_EXTENSION, * PSRB_EXTENSION;
 #pragma pack()
 
@@ -307,4 +307,3 @@ typedef struct {
 #define SPC3_SCSI_SENSEQ_MODE_PARAMETERS_CHANGED            0x01
 #define SPC3_SCSI_SENSEQ_CAPACITY_DATA_HAS_CHANGED          0x09
 
-#endif ___VIOSCSI__H__
